@@ -1,0 +1,64 @@
+# FFT-Diff configuration file
+# Usage: python train.py --config config.yaml
+# CLI args still override values set here (e.g. --batch_size 32).
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  csv: data/ETTh1.csv
+  target_col: null          # null = multivariate; set to a column name for univariate
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  context_length: 96
+  prediction_length: 96
+  patch_size: 24
+
+  d_model_encoder: 128
+  n_encoder_layers: 2
+
+  d_model_denoiser: 128
+  n_denoiser_layers: 2
+
+  n_heads: 4
+  mlp_ratio: 4
+  dropout: 0.1
+
+  denoiser_type: dit        # "dit" or "csdi"
+
+  # Diffusion
+  num_diffusion_steps: 50
+  num_sampling_steps: 10
+  num_fft_stages: 8
+  stage_schedule: linear    # linear | cosine | quadratic | sqrt
+  topk_schedule: linear     # linear | cosine | quadratic | sqrt
+  noise_schedule: linear    # linear | cosine | quad | sigmoid
+  beta_start: 0.0001
+  beta_end: 0.1
+  eta: 1.0                  # DDIM eta; 0 = deterministic
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  learning_rate: 0.0005
+  weight_decay: 0.01
+  batch_size: 64
+  num_epochs: 50
+  gradient_clip: 1.0
+
+  lr_scheduler: cosine      # cosine | step | none
+  warmup_epochs: 5
+
+  use_ema: true
+  ema_decay: 0.99
+
+  # Early stopping (inference)
+  use_early_stop: false
+  num_pilot_samples: 100
+  early_stop_safety_margin: 0
+
+  # Logging & checkpointing
+  num_workers: 2
+  eval_interval: 5
+  save_interval: 10
+  checkpoint_dir: checkpoints
+  seed: 42
+  device: auto              # auto | cpu | cuda
