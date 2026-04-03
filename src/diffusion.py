@@ -296,7 +296,7 @@ class FFTDiffusion(nn.Module):
             y:       target  [B, pred_len, C]
             context: history [B, ctx_len, C]
         Returns:
-            loss_dict with keys 'total', 'stage', 'degrad', 'recon'
+            loss_dict with keys 'total', 'stage', 'degrad'
         """
         B = y.shape[0]
         device = y.device
@@ -318,19 +318,16 @@ class FFTDiffusion(nn.Module):
         # Losses
         stage_loss = F.mse_loss(y0_pred, y_target, reduction="none")
         degrad_loss = F.mse_loss(delta_pred, delta_target, reduction="none")
-        recon_loss = F.mse_loss(y0_pred + delta_pred, y_k, reduction="none")
 
         # Filter outliers
         stage_loss = stage_loss[stage_loss < 100].mean()
         degrad_loss = degrad_loss[degrad_loss < 100].mean()
-        recon_loss = recon_loss[recon_loss < 100].mean()
 
         total = stage_loss + degrad_loss
         return {
             "total": total,
             "stage": stage_loss,
             "degrad": degrad_loss,
-            "recon": recon_loss,
         }
 
     # ── Inference (DDIM-style fast sampling) ──────────────────────────────

@@ -38,6 +38,10 @@ class ModelConfig:
     prediction_length: int = 96
     num_features: int = 1  # determined at runtime
 
+    # RevIN
+    use_revin: bool = True
+    revin_affine: bool = False
+
     # Patch embedding
     patch_size: int = 24
 
@@ -91,6 +95,16 @@ class TrainingConfig:
     use_ema: bool = True
     ema_decay: float = 0.99
 
+    # AMP (automatic mixed precision)
+    use_amp: bool = False
+    amp_dtype: str = "float16"  # float16 or bfloat16
+
+    # Training early stopping (patience-based on val loss)
+    patience: int = 0  # 0 = disabled
+
+    # Resume from checkpoint
+    resume: str = ""  # path to checkpoint, empty = start fresh
+
     # Data
     num_workers: int = 2
     pin_memory: bool = True
@@ -99,6 +113,9 @@ class TrainingConfig:
     use_early_stop: bool = False
     num_pilot_samples: int = 100
     early_stop_safety_margin: int = 0
+
+    # Sampling
+    num_samples: int = 1  # ensemble size for evaluation
 
     # Logging
     log_interval: int = 50
