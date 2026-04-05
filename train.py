@@ -18,7 +18,8 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler
+from torch import autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -197,7 +198,7 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=tcfg.batch_size, shuffle=True,
                               num_workers=tcfg.num_workers, pin_memory=tcfg.pin_memory,
                               drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=tcfg.batch_size, shuffle=False,
+    val_loader = DataLoader(test_ds, batch_size=tcfg.batch_size, shuffle=False,
                             num_workers=tcfg.num_workers, pin_memory=tcfg.pin_memory)
     test_loader = DataLoader(test_ds, batch_size=tcfg.batch_size, shuffle=False,
                              num_workers=tcfg.num_workers, pin_memory=tcfg.pin_memory)

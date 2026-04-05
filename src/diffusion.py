@@ -317,6 +317,12 @@ class FFTDiffusion(nn.Module):
 
         # Losses
         stage_loss = F.mse_loss(y0_pred, y_target, reduction="none")
+        fft1 = torch.fft.fft(y0_pred.transpose(1, 2), norm='forward')
+        fft2 = torch.fft.fft(y_target.transpose(1, 2), norm='forward')
+        fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
+        fourier_loss = F.mse_loss(torch.real(fft1), torch.real(fft2), reduction='none') \
+                        + F.mse_loss(torch.imag(fft1), torch.imag(fft2), reduction='none')
+        stage_loss +=  1.0 * fourier_loss
         degrad_loss = F.mse_loss(delta_pred, delta_target, reduction="none")
 
         # Filter outliers

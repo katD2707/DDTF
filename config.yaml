@@ -4,17 +4,17 @@
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
-  csv: data/ETTh1.csv
+  csv: /cm/archive/datnc13/data/timeseries/ETTh1.csv
   target_col: null          # null = multivariate; set to a column name for univariate
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
   context_length: 96
-  prediction_length: 96
+  prediction_length: 192
   patch_size: 24
 
   # RevIN (instance normalization for distribution shift)
-  use_revin: true
+  use_revin: false
   revin_affine: false
 
   d_model_encoder: 128
@@ -30,9 +30,9 @@ model:
   denoiser_type: dit        # "dit" or "csdi"
 
   # Diffusion
-  num_diffusion_steps: 50
-  num_sampling_steps: 10
-  num_fft_stages: 8
+  num_diffusion_steps: 1000
+  num_sampling_steps: 20
+  num_fft_stages: 10
   stage_schedule: linear    # linear | cosine | quadratic | sqrt
   topk_schedule: linear     # linear | cosine | quadratic | sqrt
   noise_schedule: linear    # linear | cosine | quad | sigmoid
@@ -45,37 +45,37 @@ training:
   learning_rate: 0.0005
   weight_decay: 0.01
   batch_size: 64
-  num_epochs: 50
+  num_epochs: 30
   gradient_clip: 1.0
 
   lr_scheduler: cosine      # cosine | step | none
   warmup_epochs: 5
 
-  use_ema: true
-  ema_decay: 0.99
+  use_ema: false
+  ema_decay: 0.999
 
   # AMP (automatic mixed precision)
   use_amp: false
   amp_dtype: float16         # float16 or bfloat16
 
   # Training early stopping (patience-based on val MSE)
-  patience: 0                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
+  patience: 5                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
 
   # Resume from checkpoint
   resume: ""                 # path to epoch_N.pt checkpoint, empty = start fresh
 
   # Early stopping (inference)
-  use_early_stop: false
-  num_pilot_samples: 100
+  use_early_stop: true
+  num_pilot_samples: 128
   early_stop_safety_margin: 0
 
   # Sampling
-  num_samples: 1              # ensemble size for evaluation
+  num_samples: 50              # ensemble size for evaluation
 
   # Logging & checkpointing
   num_workers: 2
-  eval_interval: 5
+  eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints
+  checkpoint_dir: checkpoints/normal
   seed: 42
   device: auto              # auto | cpu | cuda
