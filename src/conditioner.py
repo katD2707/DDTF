@@ -43,6 +43,8 @@ class ConditionEncoder(nn.Module):
         """
         B, L, C = x.shape
         x = rearrange(x, "b l c -> b c l")       # [B, C, L]
+        h = self.patch_emb(x)                      # [B, P, D]
+        h = self.encoder(h)                         # [B, P, D]
         if self.channel_independent:
             h = rearrange(h, "(b c) p d -> b c p d", b=B, c=C)
         else:
