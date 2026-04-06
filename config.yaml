@@ -29,6 +29,9 @@ model:
 
   denoiser_type: dit        # "dit" or "csdi"
 
+  # Channel mode
+  channel_independent: true  # true = per-channel; false = project [patch_size*C]→d_embed
+
   # Diffusion
   num_diffusion_steps: 1000
   num_sampling_steps: 20

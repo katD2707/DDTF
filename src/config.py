@@ -58,6 +58,9 @@ class ModelConfig:
     # Denoiser type
     denoiser_type: Literal["dit", "csdi"] = "dit"
 
+    # Channel mode
+    channel_independent: bool = True   # True = per-channel; False = project [patch_size*C]→d_embed
+
     # Common
     dropout: float = 0.1
 

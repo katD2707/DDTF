@@ -104,23 +104,31 @@ class DiTDenoiser(nn.Module):
         n_heads: int,
         mlp_ratio: int = 4,
         dropout: float = 0.1,
+        channel_independent: bool = True,
+        num_features: int = 1,
     ):
         super().__init__()
         self.prediction_length = prediction_length
         self.patch_size = patch_size
         self.d_model = d_model
+        self.channel_independent = channel_independent
+        self.num_features = num_features
 
         d_embed = d_model // 2
-        self.patch_embedding = PatchEmbedding(patch_size, d_embed, use_positional=True)
-        self.context_proj = nn.Linear(num_context_patches * d_model_condition, d_embed)
         self.timestep_emb = TimestepEmbedding(d_model)
+        self.context_proj = nn.Linear(num_context_patches * d_model_condition, d_embed)
+
+        nf = 1 if channel_independent else num_features
+        self.patch_embedding = PatchEmbedding(patch_size, d_embed,
+                                              use_positional=True, num_features=nf)
+        out_patch = patch_size * nf
 
         self.blocks = nn.ModuleList([
             AdaLNBlock(d_model, n_heads, mlp_ratio, dropout)
             for _ in range(n_layers)
         ])
-        self.final_layer = FinalLayer(d_model, patch_size)
-        self.delta_head = FinalLayer(d_model, patch_size)
+        self.final_layer = FinalLayer(d_model, out_patch)
+        self.delta_head = FinalLayer(d_model, out_patch)
 
         self._init_weights()
 
@@ -160,9 +168,13 @@ class DiTDenoiser(nn.Module):
         """
         B, L, C = yt.shape
 
-        # Channel-independent: treat each channel separately
-        yt_ci = rearrange(yt, "b l c -> b c l")   # [B, C, L]
-        t_rep = repeat(t, "b -> (b c)", c=C)       # [B*C]
+        if self.channel_independent:
+            return self._forward_ci(yt, t, cond, B, L, C)
+        return self._forward_cd(yt, t, cond, B, L, C)
+
+    def _forward_ci(self, yt, t, cond, B, L, C):
+        yt_ci = rearrange(yt, "b l c -> b c l")
+        t_rep = repeat(t, "b -> (b c)", c=C)
 
         h = self.patch_embedding(yt_ci)             # [B*C, P, d_embed]
         num_patches = h.shape[1]
@@ -183,4 +195,33 @@ class DiTDenoiser(nn.Module):
 
         y0_out = rearrange(y0_out, "(b c) l -> b l c", b=B, c=C)
         delta_out = rearrange(delta_out, "(b c) l -> b l c", b=B, c=C)
+        return y0_out, delta_out
+
+    # ── channel-dependent forward ─────────────────────────────────────────
+
+    def _forward_cd(self, yt, t, cond, B, L, C):
+        P = self.patch_size
+        yt = rearrange(yt, "b l c -> b c l")
+
+        h = self.patch_embedding(yt)               # [B, nP, d_embed]
+        num_patches = h.shape[1]
+
+        # Condition: average over C, flatten, project
+        cond_avg = cond.mean(dim=1)                        # [B, P_cond, D_cond]
+        cond_flat = cond_avg.reshape(B, -1)
+        cond_emb = self.context_proj(cond_flat)            # [B, d_embed]
+        cond_emb = cond_emb.unsqueeze(1).expand(-1, num_patches, -1)
+        h = torch.cat([h, cond_emb], dim=-1)               # [B, nP, d_model]
+
+        c = self.timestep_emb(t)
+        for block in self.blocks:
+            h = block(h, c)
+
+        # [B, nP, P*C] → [B, L, C]
+        y0_out = self.final_layer(h, c).reshape(B, -1, P, C)
+        y0_out = y0_out.reshape(B, -1, C)[:, :L, :]
+
+        delta_out = self.delta_head(h, c).reshape(B, -1, P, C)
+        delta_out = delta_out.reshape(B, -1, C)[:, :L, :]
+
         return y0_out, delta_out

@@ -2,9 +2,10 @@
 
 import math
 from typing import Optional, Tuple
-
+from einops import rearrange
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -60,24 +61,33 @@ class RotaryPositionalEmbedding(nn.Module):
 # ── Patch Embedding ──────────────────────────────────────────────────────────
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, patch_size: int = 24, d_model: int = 128, use_positional: bool = True):
+    def __init__(self, patch_size: int = 24, d_model: int = 128,
+                 use_positional: bool = True, num_features: int = 1):
         super().__init__()
         self.patch_size = patch_size
         self.stride = patch_size
-        self.projection = nn.Linear(patch_size, d_model, bias=False)
+        self.num_features = num_features
+        self.projection = nn.Linear(patch_size * num_features, d_model, bias=False)
         self.padding_layer = nn.ReplicationPad1d((0, patch_size))
         self.pos_emb = PositionalEmbedding(d_model) if use_positional else None
 
     def forward(self, x: Tensor) -> Tensor:
-        """x: [B*C, L] or [B, C, L]  →  [B*C, num_patches, d_model]"""
+        """
+        Channel-independent (num_features=1):
+            x: [B*C, L] or [B, C, L]  →  [B*C, num_patches, d_model]
+        Channel-dependent (num_features>1):
+            x: [B, L, C]  →  [B, num_patches, d_model]
+        """
         if x.dim() == 3:
             B, C, L = x.shape
-            x = x.reshape(B * C, L)
+            x = rearrange(x, "b c l -> (b c) l")
         else:
             L = x.shape[-1]
         if (L - self.patch_size) % self.stride != 0:
             x = self.padding_layer(x.unsqueeze(1)).squeeze(1)
-        x = x.unfold(-1, self.patch_size, self.stride)
+        x = x.unfold(-1, self.patch_size, self.stride)  # [B*C, N, P]
+        if self.num_features > 1:
+            x = rearrange(x, "(b c) p d -> b p (c d)", c=self.num_features)
         x = self.projection(x)
         if self.pos_emb is not None:
             x = x + self.pos_emb(x)

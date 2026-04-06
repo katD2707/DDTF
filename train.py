@@ -110,6 +110,7 @@ def parse_args():
                         choices=["dit", "csdi"])
     parser.add_argument("--use_revin", action="store_true", default=None)
     parser.add_argument("--no_revin", dest="use_revin", action="store_false")
+    parser.add_argument("--channel_independent", action="store_true", default=None)
     parser.add_argument("--num_diffusion_steps", type=int, default=None)
     parser.add_argument("--num_sampling_steps", type=int, default=None)
     parser.add_argument("--num_fft_stages", type=int, default=None)

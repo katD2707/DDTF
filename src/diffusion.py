@@ -183,6 +183,8 @@ class FFTDiffusion(nn.Module):
         topk_schedule: str = "linear",
         eta: float = 1.0,
         denoiser_type: str = "dit",
+        channel_independent: bool = True,
+        num_features: int = 1,
     ):
         super().__init__()
         self.context_length = context_length
@@ -195,6 +197,7 @@ class FFTDiffusion(nn.Module):
         # Sub-modules
         self.condition_encoder = ConditionEncoder(
             context_length, patch_size, d_model_encoder, n_encoder_layers, n_heads, dropout,
+            channel_independent=channel_independent, num_features=num_features,
         )
         num_ctx_patches = self.condition_encoder.num_patches
 
@@ -210,6 +213,8 @@ class FFTDiffusion(nn.Module):
                 num_diffusion_steps=num_diffusion_steps,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                channel_independent=channel_independent,
+                num_features=num_features,
             )
         else:
             self.denoiser = DiTDenoiser(
@@ -222,6 +227,8 @@ class FFTDiffusion(nn.Module):
                 n_heads=n_heads,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                channel_independent=channel_independent,
+                num_features=num_features,
             )
 
         # Staged FFT
@@ -479,4 +486,6 @@ class FFTDiffusion(nn.Module):
             topk_schedule=cfg.topk_schedule,
             eta=cfg.eta,
             denoiser_type=cfg.denoiser_type,
+            channel_independent=cfg.channel_independent,
+            num_features=cfg.num_features,
         )

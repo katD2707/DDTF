@@ -187,11 +187,14 @@ class CSDIDenoiser(nn.Module):
         diff_emb_dim: int = 128,
         mlp_ratio: int = 4,     # unused, kept for interface compat
         dropout: float = 0.1,   # unused, kept for interface compat
+        channel_independent: bool = True,
+        num_features: int = 1,
     ):
         super().__init__()
         self.prediction_length = prediction_length
         self.d_cond = d_model_condition
         self.num_patches = num_context_patches
+        self.channel_independent = channel_independent
 
         # Side-info dimension:
         #   time_emb (d_model_condition) + feat_emb (d_model_condition) + 1 (cond_mask)
@@ -248,36 +251,66 @@ class CSDIDenoiser(nn.Module):
         B, L, C = yt.shape
         device = yt.device
 
+        if self.channel_independent:
+            return self._forward_ci(yt, t, cond, B, L, C, device)
+        return self._forward_cd(yt, t, cond, B, L, C, device)
+
+    # ── channel-independent forward (original) ───────────────────────────
+
+    def _forward_ci(self, yt, t, cond, B, L, C, device):
         # ── Build side-info  (B, side_dim, C, L) ─────────────────────────
         # Time (position) embedding  -> (L, time_emb_dim) -> (B, L, C, D)
         t_pe = self._sinusoidal_time_emb(L, self.time_emb_dim, device)
         t_pe = t_pe.unsqueeze(0).unsqueeze(2).expand(B, L, C, -1)
 
-        # Feature embedding -> (C, feat_emb_dim) -> (B, L, C, D)
         f_ids = torch.arange(C, device=device)
         f_pe = self.feat_embed(f_ids).unsqueeze(0).unsqueeze(0).expand(B, L, C, -1)
 
-        side = torch.cat([t_pe, f_pe], dim=-1)          # (B, L, C, side-2)
-        side = side.permute(0, 3, 2, 1)                  # (B, D, C, L)
-
-        # Condition mask channel (all ones = fully observed context)
+        side = torch.cat([t_pe, f_pe], dim=-1).permute(0, 3, 2, 1)
         cond_mask = torch.ones(B, 1, C, L, device=device)
-        side = torch.cat([side, cond_mask], dim=1)        # (B, side_dim, C, L)
+        side = torch.cat([side, cond_mask], dim=1)
 
         # ── Build 2-channel input  (B, 2, C, L) ─────────────────────────
-        noisy = yt.permute(0, 2, 1).unsqueeze(1)         # (B, 1, C, L)
+        noisy = yt.permute(0, 2, 1).unsqueeze(1)
 
-        # Project condition patches to per-timestep values
-        cond_flat = rearrange(cond, "b c p d -> (b c) (p d)")       # (B*C, P*D)
-        cond_seq = self.cond_proj(cond_flat)                         # (B*C, L)
+        cond_flat = rearrange(cond, "b c p d -> (b c) (p d)")
+        cond_seq = self.cond_proj(cond_flat)
         cond_seq = rearrange(cond_seq, "(b c) l -> b 1 c l", b=B, c=C)
-        inp = torch.cat([cond_seq, noisy], dim=1)        # (B, 2, C, L)
+        inp = torch.cat([cond_seq, noisy], dim=1)
 
         # ── Run backbone ─────────────────────────────────────────────────
-        out = self.backbone(inp, side, t)                  # (B, 2, C, L)
-        y0_out = out[:, 0]                                 # (B, C, L)
-        delta_out = out[:, 1]                              # (B, C, L)
+        out = self.backbone(inp, side, t)
+        y0_out = out[:, 0].permute(0, 2, 1)
+        delta_out = out[:, 1].permute(0, 2, 1)
+        return y0_out, delta_out
 
-        y0_out = y0_out.permute(0, 2, 1)                   # (B, L, C)
-        delta_out = delta_out.permute(0, 2, 1)
+    # ── channel-dependent forward ─────────────────────────────────────────
+
+    def _forward_cd(self, yt, t, cond, B, L, C, device):
+        # ── Build side-info  (B, side_dim, C, L) ─────────────────────────
+        t_pe = self._sinusoidal_time_emb(L, self.time_emb_dim, device)
+        t_pe = t_pe.unsqueeze(0).unsqueeze(2).expand(B, L, C, -1)
+
+        f_ids = torch.arange(C, device=device)
+        f_pe = self.feat_embed(f_ids).unsqueeze(0).unsqueeze(0).expand(B, L, C, -1)
+
+        side = torch.cat([t_pe, f_pe], dim=-1).permute(0, 3, 2, 1)
+        cond_mask = torch.ones(B, 1, C, L, device=device)
+        side = torch.cat([side, cond_mask], dim=1)
+
+        # ── Build 2-channel input  (B, 2, C, L) ─────────────────────────
+        noisy = yt.permute(0, 2, 1).unsqueeze(1)
+
+        # Condition: average over C, project to L, broadcast across C
+        cond_avg = cond.mean(dim=1)              # [B, P, D_cond]
+        cond_flat = cond_avg.reshape(B, -1)      # [B, P * D_cond]
+        cond_seq = self.cond_proj(cond_flat)     # [B, L]
+        cond_seq = cond_seq.reshape(B, 1, 1, L).expand(B, 1, C, L)
+
+        inp = torch.cat([cond_seq, noisy], dim=1)
+
+        # ── Run backbone ─────────────────────────────────────────────────
+        out = self.backbone(inp, side, t)
+        y0_out = out[:, 0].permute(0, 2, 1)
+        delta_out = out[:, 1].permute(0, 2, 1)
         return y0_out, delta_out
