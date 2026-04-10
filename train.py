@@ -67,7 +67,9 @@ def evaluate(
         if revin is not None:
             ctx = revin(ctx, mode="norm")
 
-        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step)
+        revin_stats = (revin.mean, revin.stdev) if revin is not None else None
+        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
+                            revin_stats=revin_stats)
 
         if revin is not None:
             pred = revin(pred, mode="denorm")
@@ -111,6 +113,7 @@ def parse_args():
     parser.add_argument("--use_revin", action="store_true", default=None)
     parser.add_argument("--no_revin", dest="use_revin", action="store_false")
     parser.add_argument("--channel_independent", action="store_true", default=None)
+    parser.add_argument("--use_destationary", action="store_true", default=None)
     parser.add_argument("--num_diffusion_steps", type=int, default=None)
     parser.add_argument("--num_sampling_steps", type=int, default=None)
     parser.add_argument("--num_fft_stages", type=int, default=None)
@@ -304,8 +307,10 @@ def main():
 
             optimizer.zero_grad()
 
+            revin_stats = (revin.mean, revin.stdev) if revin is not None else None
+
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss_dict = model(tgt, ctx)
+                loss_dict = model(tgt, ctx, revin_stats=revin_stats)
                 loss = loss_dict["total"]
 
             scaler.scale(loss).backward()
@@ -343,9 +348,11 @@ def main():
                 pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
                 if revin is not None:
                     pilot_ctx = revin(pilot_ctx, mode="norm")
+                pilot_revin_stats = (revin.mean, revin.stdev) if revin is not None else None
                 es_result = model.find_optimal_stop_step(
                     pilot_ctx, num_samples=tcfg.num_samples,
                     safety_margin=tcfg.early_stop_safety_margin,
+                    revin_stats=pilot_revin_stats,
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
@@ -418,9 +425,11 @@ def main():
         pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
         if revin is not None:
             pilot_ctx = revin(pilot_ctx, mode="norm")
+        pilot_revin_stats = (revin.mean, revin.stdev) if revin is not None else None
         es_result = model.find_optimal_stop_step(
             pilot_ctx, num_samples=tcfg.num_samples,
             safety_margin=tcfg.early_stop_safety_margin,
+            revin_stats=pilot_revin_stats,
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")

@@ -43,6 +43,10 @@ model:
   beta_end: 0.1
   eta: 1.0                  # DDIM eta; 0 = deterministic
 
+  # De-stationary attention (Non-stationary Transformers, NeurIPS 2022)
+  # Only effective when use_revin is true and denoiser_type is "dit"
+  use_destationary: false
+
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   learning_rate: 0.0005

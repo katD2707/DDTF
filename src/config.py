@@ -75,6 +75,9 @@ class ModelConfig:
     topk_schedule: Literal["linear", "cosine", "quadratic", "sqrt"] = "linear"
     eta: float = 1.0  # DDIM eta
 
+    # De-stationary attention (Non-stationary Transformers, NeurIPS 2022)
+    use_destationary: bool = False
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Training

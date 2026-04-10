@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 from src.conditioner import ConditionEncoder
 from src.dit_denoiser import DiTDenoiser
 from src.csdi_denoiser import CSDIDenoiser
+from src.revin import Projector
 from src.early_stopping import find_global_early_stop
 from src.utils import default, extract
 
@@ -185,6 +186,7 @@ class FFTDiffusion(nn.Module):
         denoiser_type: str = "dit",
         channel_independent: bool = True,
         num_features: int = 1,
+        use_destationary: bool = False,
     ):
         super().__init__()
         self.context_length = context_length
@@ -193,11 +195,14 @@ class FFTDiffusion(nn.Module):
         self.num_sampling_steps = num_sampling_steps
         self.num_fft_stages = num_fft_stages
         self.eta = eta
+        self.channel_independent = channel_independent
+        self.use_destationary = use_destationary
 
         # Sub-modules
         self.condition_encoder = ConditionEncoder(
             context_length, patch_size, d_model_encoder, n_encoder_layers, n_heads, dropout,
             channel_independent=channel_independent, num_features=num_features,
+            use_destationary=use_destationary,
         )
         num_ctx_patches = self.condition_encoder.num_patches
 
@@ -229,6 +234,7 @@ class FFTDiffusion(nn.Module):
                 dropout=dropout,
                 channel_independent=channel_independent,
                 num_features=num_features,
+                use_destationary=use_destationary,
             )
 
         # Staged FFT
@@ -238,6 +244,22 @@ class FFTDiffusion(nn.Module):
 
         # Standard DDPM schedule (used for the Gaussian noise component)
         self._setup_schedule(num_diffusion_steps, beta_start, beta_end, noise_schedule)
+
+        # De-stationary attention projectors (Non-stationary Transformers)
+        # Shared projectors output per-head scalars [B_eff, H].
+        # Each sub-module (conditioner / denoiser) has its own learned
+        # delta_expand to project the per-head scalar to its sequence length.
+        if use_destationary:
+            enc_in = 1 if channel_independent else num_features
+            self.tau_learner = Projector(
+                enc_in=enc_in, seq_len=context_length,
+                hidden_dim=d_model_denoiser, output_dim=n_heads,
+            )
+            self.delta_learner = Projector(
+                enc_in=enc_in, seq_len=context_length,
+                hidden_dim=d_model_denoiser, output_dim=n_heads,
+            )
+            self._n_heads = n_heads
 
     # ── schedule helpers ──────────────────────────────────────────────────
 
@@ -295,7 +317,36 @@ class FFTDiffusion(nn.Module):
 
     # ── Training forward ─────────────────────────────────────────────────
 
-    def forward(self, y: Tensor, context: Tensor):
+    def _compute_destationary(self, context: Tensor,
+                              revin_stats: Optional[Tuple[Tensor, Tensor]]):
+        """
+        Compute de-stationary attention factors from context + RevIN stats.
+
+        Returns (tau, delta) or (None, None) if disabled / stats unavailable.
+        tau:   [B_eff, H, 1, 1]  multiplicative scale (ready for attn scores)
+        delta: [B_eff, H]        per-head additive bias (expanded by each module)
+        """
+        if not self.use_destationary or revin_stats is None:
+            return None, None
+
+        mean, std = revin_stats  # each [B, 1, C]
+
+        if self.channel_independent:
+            ctx = rearrange(context, "b l c -> (b c) l 1")      # [B*C, L, 1]
+            mean_p = rearrange(mean, "b 1 c -> (b c) 1 1")
+            std_p = rearrange(std, "b 1 c -> (b c) 1 1")
+        else:
+            ctx = context                                         # [B, L, C]
+            mean_p, std_p = mean, std
+
+        tau = self.tau_learner(ctx, std_p).exp()                  # [B_eff, H]
+        delta = self.delta_learner(ctx, mean_p)                   # [B_eff, H]
+
+        tau = tau.unsqueeze(-1).unsqueeze(-1)                     # [B_eff, H, 1, 1]
+        return tau, delta
+
+    def forward(self, y: Tensor, context: Tensor,
+                revin_stats: Optional[Tuple[Tensor, Tensor]] = None):
         """
         Training step.
 
@@ -309,7 +360,8 @@ class FFTDiffusion(nn.Module):
         device = y.device
 
         t = torch.randint(0, self.num_diffusion_steps, (B,), device=device)
-        cond = self.condition_encoder(context)
+        tau, delta = self._compute_destationary(context, revin_stats)
+        cond = self.condition_encoder(context, tau=tau, delta=delta)
 
         # FFT degradation targets
         y_target, y_k = self._compute_xt(y, t)
@@ -319,7 +371,7 @@ class FFTDiffusion(nn.Module):
         y_t = self.q_sample(y_target, t, noise)
 
         # Predict
-        y0_pred, delta_pred = self.denoiser(y_t, t, cond)
+        y0_pred, delta_pred = self.denoiser(y_t, t, cond, tau=tau, delta=delta)
         delta_target = y_k - y_target
 
         # Losses
@@ -352,6 +404,7 @@ class FFTDiffusion(nn.Module):
         num_samples: int = 1,
         stop_step: Optional[int] = None,
         return_scores: bool = False,
+        revin_stats: Optional[Tuple[Tensor, Tensor]] = None,
     ):
         """
         Generate forecasts via DDIM sampling.
@@ -361,15 +414,21 @@ class FFTDiffusion(nn.Module):
             num_samples: ensemble size
             stop_step: if set, stop early at this diffusion timestep
             return_scores: if True, return (pred, scores, steps) for pilot calibration
+            revin_stats: optional (mean [B,1,C], std [B,1,C]) from RevIN
         Returns:
             predictions [B, pred_len, C]  (or tuple when return_scores=True)
         """
         B_orig, _, C = context.shape
         device = context.device
 
-        cond = self.condition_encoder(context)
+        tau, delta = self._compute_destationary(context, revin_stats)
+
+        cond = self.condition_encoder(context, tau=tau, delta=delta)
         if num_samples > 1:
             cond = repeat(cond, "b c p d -> (b n) c p d", n=num_samples)
+            if tau is not None:
+                tau = repeat(tau, "b ... -> (b n) ...", n=num_samples)
+                delta = repeat(delta, "b ... -> (b n) ...", n=num_samples)
 
         B_eff = B_orig * num_samples
         y_t = torch.randn(B_eff, self.prediction_length, C, device=device)
@@ -384,7 +443,7 @@ class FFTDiffusion(nn.Module):
             t_b = torch.full((B_eff,), t_now, device=device, dtype=torch.long)
             t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
 
-            y0_pred, delta_pred = self.denoiser(y_t, t_b, cond)
+            y0_pred, delta_pred = self.denoiser(y_t, t_b, cond, tau=tau, delta=delta)
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
             candidate = y0_pred + delta_pred
 
@@ -436,6 +495,7 @@ class FFTDiffusion(nn.Module):
         smooth_window: Optional[int] = None,
         min_frac: float = 0.1,
         safety_margin: int = 0,
+        revin_stats: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> dict:
         """
         Run pilot samples through full diffusion to find the optimal
@@ -447,12 +507,14 @@ class FFTDiffusion(nn.Module):
             smooth_window: moving-avg window (None = auto)
             min_frac: min fraction of trajectory on each side
             safety_margin: stop this many indices before breakpoint
+            revin_stats: optional (mean [B,1,C], std [B,1,C]) from RevIN
 
         Returns:
             dict from find_global_early_stop
         """
         _, scores, steps = self.sample(
             pilot_contexts, num_samples=num_samples, return_scores=True,
+            revin_stats=revin_stats,
         )
         return find_global_early_stop(
             scores=scores, steps=steps,
@@ -488,4 +550,5 @@ class FFTDiffusion(nn.Module):
             denoiser_type=cfg.denoiser_type,
             channel_independent=cfg.channel_independent,
             num_features=cfg.num_features,
+            use_destationary=cfg.use_destationary,
         )

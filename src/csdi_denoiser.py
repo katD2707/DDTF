@@ -239,12 +239,16 @@ class CSDIDenoiser(nn.Module):
         yt: Tensor,
         t: Tensor,
         cond: Tensor,
+        tau: Optional[Tensor] = None,
+        delta: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
-            yt:   [B, L, C]  noisy target
-            t:    [B]        timesteps
-            cond: [B, C, P, D_cond]  from ConditionEncoder
+            yt:    [B, L, C]  noisy target
+            t:     [B]        timesteps
+            cond:  [B, C, P, D_cond]  from ConditionEncoder
+            tau:   ignored (CSDI uses nn.TransformerEncoder internally)
+            delta: ignored
         Returns:
             (y0_pred, delta_pred)  each [B, L, C]
         """

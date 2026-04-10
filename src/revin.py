@@ -72,3 +72,42 @@ class RevIN(nn.Module):
             x = (x - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
         x = x * self.stdev + self.mean
         return x
+
+
+class Projector(nn.Module):
+    """
+    MLP that learns de-stationary factors (tau or delta) from raw input
+    and its normalization statistics.
+
+    Args:
+        enc_in:      number of input features (channels)
+        seq_len:     input sequence length
+        hidden_dim:  MLP hidden dimension
+        output_dim:  output dimension (n_heads for tau, seq_len*n_heads for delta)
+    """
+
+    def __init__(self, enc_in: int, seq_len: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.series_conv = nn.Conv1d(
+            in_channels=seq_len, out_channels=1,
+            kernel_size=3, padding=1, padding_mode="circular", bias=False,
+        )
+        self.backbone = nn.Sequential(
+            nn.Linear(2 * enc_in, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim, bias=False),
+        )
+
+    def forward(self, x: Tensor, stats: Tensor) -> Tensor:
+        """
+        Args:
+            x:     [B, S, C]  raw (un-normalized) series
+            stats: [B, 1, C]  normalization statistic (mean or std)
+        Returns:
+            y:     [B, output_dim]
+        """
+        B = x.shape[0]
+        h = self.series_conv(x)               # [B, 1, C]
+        h = torch.cat([h, stats], dim=1)      # [B, 2, C]
+        h = h.reshape(B, -1)                  # [B, 2*C]
+        return self.backbone(h)
