@@ -76,6 +76,7 @@ class ConditionEncoder(nn.Module):
         super().__init__()
         self.channel_independent = channel_independent
         self.use_destationary = use_destationary
+        self.n_heads = n_heads
         nf = 1 if channel_independent else num_features
         self.patch_emb = PatchEmbedding(patch_size, d_model, use_positional=True,
                                         num_features=nf)
@@ -106,7 +107,7 @@ class ConditionEncoder(nn.Module):
         # Project delta to sequence length
         if delta is not None and self.use_destationary:
             delta = self.delta_proj(delta)  # [B_eff, H * nP]
-            delta = delta.reshape(B, -1, 1, self.num_patches)
+            delta = delta.reshape(-1, self.n_heads, 1, self.num_patches)
 
         for block in self.blocks:
             h = block(h, tau=tau, delta=delta)
