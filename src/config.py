@@ -55,9 +55,6 @@ class ModelConfig:
     n_denoiser_layers: int = 2
     mlp_ratio: int = 4
 
-    # Denoiser type
-    denoiser_type: Literal["dit", "csdi"] = "dit"
-
     # Channel mode
     channel_independent: bool = True   # True = per-channel; False = project [patch_size*C]→d_embed
 
@@ -75,8 +72,9 @@ class ModelConfig:
     topk_schedule: Literal["linear", "cosine", "quadratic", "sqrt"] = "linear"
     eta: float = 1.0  # DDIM eta
 
-    # De-stationary attention (Non-stationary Transformers, NeurIPS 2022)
-    use_destationary: bool = False
+    # Transform type: "fft" (frequency filtering) or "ma" (repeated moving average)
+    transform_type: Literal["fft", "ma"] = "fft"
+    ma_kernel_size: int = 3  # box-kernel width for MA transform
 
 
 # ═════════════════════════════════════════════════════════════════════════════

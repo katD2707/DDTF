@@ -102,9 +102,7 @@ def run_evaluation(
         if revin is not None:
             ctx = revin(ctx, mode="norm")
 
-        revin_stats = (revin.mean, revin.stdev) if revin is not None else None
-        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                            revin_stats=revin_stats)
+        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step)
 
         if revin is not None:
             pred = revin(pred, mode="denorm")
@@ -164,11 +162,9 @@ def main():
         pilot_ctx = pilot_ctx[:args.num_pilot_samples].to(device)
         if revin is not None:
             pilot_ctx = revin(pilot_ctx, mode="norm")
-        pilot_revin_stats = (revin.mean, revin.stdev) if revin is not None else None
         es = model.find_optimal_stop_step(
             pilot_ctx, num_samples=args.num_samples,
             safety_margin=args.auto_stop_safety_margin,
-            revin_stats=pilot_revin_stats,
         )
         stop_step = es["stop_step"]
         print(f"  Auto-stop: step={stop_step} (breakpoint={es['breakpoint_step']:.0f})")

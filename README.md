@@ -8,7 +8,7 @@ Noise is applied progressively in the FFT domain across **K staged degradation s
 ## Features
 
 - **FFT staged diffusion** — frequency-domain noise schedule with configurable stage/topk schedules
-- **Two denoiser backends** — DiT (transformer with adaLN-Zero and RoPE) or CSDI (residual blocks with time/feature attention)
+- **DiT denoiser** — transformer with adaLN-Zero and RoPE
 - **DDIM sampling** — fast inference with stage-boundary-aware timestep selection
 - **Early stopping inference** — piecewise-linear breakpoint calibration on pilot samples to reduce sampling steps
 - **Standard benchmark splits** — fixed train/val/test indices for ETTh1/h2, ETTm1/m2, Weather, ECL, Traffic, Exchange, ILI
@@ -30,9 +30,6 @@ Requires Python ≥ 3.9 and PyTorch ≥ 2.0.
 ```bash
 # Train with DiT denoiser (default)
 python train.py --csv data/ETTh1.csv --epochs 50
-
-# Train with CSDI denoiser
-python train.py --csv data/ETTh1.csv --denoiser_type csdi --epochs 50
 
 # Longer horizon, bigger model
 python train.py \
@@ -71,7 +68,6 @@ python train.py --csv data/ETTh1.csv --use_early_stop --num_pilot_samples 64
 | `--n_heads` | `4` | Attention heads |
 | `--mlp_ratio` | `4` | MLP expansion ratio (DiT) |
 | `--dropout` | `0.1` | Dropout rate |
-| `--denoiser_type` | `dit` | Denoiser backbone: `dit` or `csdi` |
 | **Diffusion** | | |
 | `--num_diffusion_steps` | `50` | Total diffusion timesteps T |
 | `--num_sampling_steps` | `10` | DDIM sampling steps |
@@ -133,7 +129,6 @@ fft_diff/
     ├── dataset.py            # TimeSeriesDataset + load_csv_dataset()
     ├── diffusion.py          # FFTDiffusion — main model
     ├── dit_denoiser.py       # DiT denoiser (adaLN-Zero, RoPE)
-    ├── csdi_denoiser.py      # CSDI denoiser (time/feature transformers)
     ├── embeddings.py         # TimestepEmbedding, PatchEmbedding, RoPE
     ├── early_stopping.py     # find_global_early_stop()
     └── utils.py              # extract(), default()
@@ -145,6 +140,3 @@ fft_diff/
 
 > **f-DM: A Multi-stage Diffusion Model via Progressive Signal Transformation**  
 > Gu et al., 2022 — [arXiv:2210.04955](https://arxiv.org/abs/2210.04955)
-
-> **CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation**  
-> Tashiro et al., NeurIPS 2021 — [arXiv:2107.03502](https://arxiv.org/abs/2107.03502)

@@ -6,7 +6,7 @@ conditioned on encoded context and diffusion timestep.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -45,9 +45,7 @@ class AdaLNBlock(nn.Module):
         # 6 modulation outputs: shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp
         self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model))
 
-    def forward(self, x: Tensor, c: Tensor,
-                tau: Optional[Tensor] = None,
-                delta: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
         shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp = self.adaLN(c).chunk(6, dim=-1)
 
         # Self-attention
@@ -58,12 +56,6 @@ class AdaLNBlock(nn.Module):
         q, k = self.rope(q, k)
         scale = self.head_dim ** -0.5
         attn = (q @ k.transpose(-2, -1)) * scale
-
-        # De-stationary attention: rescale scores with tau, shift with delta
-        if tau is not None:
-            attn = attn * tau
-        if delta is not None:
-            attn = attn + delta
 
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
@@ -115,7 +107,6 @@ class DiTDenoiser(nn.Module):
         dropout: float = 0.1,
         channel_independent: bool = True,
         num_features: int = 1,
-        use_destationary: bool = False,
     ):
         super().__init__()
         self.prediction_length = prediction_length
@@ -123,7 +114,6 @@ class DiTDenoiser(nn.Module):
         self.d_model = d_model
         self.channel_independent = channel_independent
         self.num_features = num_features
-        self.use_destationary = use_destationary
         self.n_heads = n_heads
 
         d_embed = d_model // 2
@@ -142,9 +132,6 @@ class DiTDenoiser(nn.Module):
         ])
         self.final_layer = FinalLayer(d_model, out_patch)
         self.delta_head = FinalLayer(d_model, out_patch)
-
-        if use_destationary:
-            self.delta_proj = nn.Linear(n_heads, n_heads * self.num_target_patches)
 
         self._init_weights()
 
@@ -173,26 +160,22 @@ class DiTDenoiser(nn.Module):
         yt: Tensor,
         t: Tensor,
         cond: Tensor,
-        tau: Optional[Tensor] = None,
-        delta: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
             yt:    noisy target [B, L, C]
             t:     timesteps [B]
             cond:  condition [B, C, P, D_cond] (CI) or [B, 1, P, D_cond] (CD)
-            tau:   optional de-stationary scale [B_eff, H, 1, 1]
-            delta: optional de-stationary bias  [B_eff, H]  (per-head scalar)
         Returns:
             (y0_pred, delta_pred)  each [B, L, C]
         """
         B, L, C = yt.shape
 
         if self.channel_independent:
-            return self._forward_ci(yt, t, cond, B, L, C, tau, delta)
-        return self._forward_cd(yt, t, cond, B, L, C, tau, delta)
+            return self._forward_ci(yt, t, cond, B, L, C)
+        return self._forward_cd(yt, t, cond, B, L, C)
 
-    def _forward_ci(self, yt, t, cond, B, L, C, tau, delta):
+    def _forward_ci(self, yt, t, cond, B, L, C):
         yt_ci = rearrange(yt, "b l c -> b c l")
         t_rep = repeat(t, "b -> (b c)", c=C)
 
@@ -204,14 +187,9 @@ class DiTDenoiser(nn.Module):
         cond_emb = repeat(cond_emb, "bc d -> bc p d", p=num_patches)
         h = torch.cat([h, cond_emb], dim=-1)        # [B*C, P, d_model]
 
-        # Project delta to sequence length
-        if delta is not None and self.use_destationary:
-            delta = self.delta_proj(delta)  # [B*C, H * nP]
-            delta = delta.reshape(-1, self.n_heads, 1, self.num_target_patches)
-
         c = self.timestep_emb(t_rep)                 # [B*C, d_model]
         for block in self.blocks:
-            h = block(h, c, tau=tau, delta=delta)
+            h = block(h, c)
 
         y0_out = self.final_layer(h, c).flatten(-2)[:, :L]
         delta_out = self.delta_head(h, c).flatten(-2)[:, :L]
@@ -222,7 +200,7 @@ class DiTDenoiser(nn.Module):
 
     # ── channel-dependent forward ─────────────────────────────────────────
 
-    def _forward_cd(self, yt, t, cond, B, L, C, tau, delta):
+    def _forward_cd(self, yt, t, cond, B, L, C):
         P = self.patch_size
         yt = rearrange(yt, "b l c -> b c l")
 
@@ -235,14 +213,9 @@ class DiTDenoiser(nn.Module):
         cond_emb = cond_emb.unsqueeze(1).expand(-1, num_patches, -1)
         h = torch.cat([h, cond_emb], dim=-1)               # [B, nP, d_model]
 
-        # Project delta to sequence length
-        if delta is not None and self.use_destationary:
-            delta = self.delta_proj(delta)  # [B, H * nP]
-            delta = delta.reshape(-1, self.n_heads, 1, self.num_target_patches)
-
         c = self.timestep_emb(t)
         for block in self.blocks:
-            h = block(h, c, tau=tau, delta=delta)
+            h = block(h, c)
 
         # [B, nP, P*C] → [B, L, C]
         y0_out = self.final_layer(h, c).reshape(B, -1, P, C)

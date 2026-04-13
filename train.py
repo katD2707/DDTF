@@ -3,7 +3,7 @@ Training script for FFT-Diffusion time series forecasting.
 
 Usage:
     python train.py --config config.yaml
-    python train.py --config config.yaml --batch_size 32 --denoiser_type csdi
+    python train.py --config config.yaml --batch_size 32
     python train.py --config config.yaml --csv data/weather.csv --num_epochs 100
     python train.py --config config.yaml --resume checkpoints/epoch_20.pt
 """
@@ -67,9 +67,7 @@ def evaluate(
         if revin is not None:
             ctx = revin(ctx, mode="norm")
 
-        revin_stats = (revin.mean, revin.stdev) if revin is not None else None
-        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                            revin_stats=revin_stats)
+        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step)
 
         if revin is not None:
             pred = revin(pred, mode="denorm")
@@ -108,12 +106,9 @@ def parse_args():
     parser.add_argument("--n_heads", type=int, default=None)
     parser.add_argument("--mlp_ratio", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
-    parser.add_argument("--denoiser_type", type=str, default=None,
-                        choices=["dit", "csdi"])
     parser.add_argument("--use_revin", action="store_true", default=None)
     parser.add_argument("--no_revin", dest="use_revin", action="store_false")
     parser.add_argument("--channel_independent", action="store_true", default=None)
-    parser.add_argument("--use_destationary", action="store_true", default=None)
     parser.add_argument("--num_diffusion_steps", type=int, default=None)
     parser.add_argument("--num_sampling_steps", type=int, default=None)
     parser.add_argument("--num_fft_stages", type=int, default=None)
@@ -123,6 +118,9 @@ def parse_args():
     parser.add_argument("--beta_start", type=float, default=None)
     parser.add_argument("--beta_end", type=float, default=None)
     parser.add_argument("--eta", type=float, default=None)
+    parser.add_argument("--transform_type", type=str, default=None,
+                        choices=["fft", "ma"])
+    parser.add_argument("--ma_kernel_size", type=int, default=None)
 
     # Training overrides
     parser.add_argument("--learning_rate", type=float, default=None)
@@ -307,10 +305,8 @@ def main():
 
             optimizer.zero_grad()
 
-            revin_stats = (revin.mean, revin.stdev) if revin is not None else None
-
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss_dict = model(tgt, ctx, revin_stats=revin_stats)
+                loss_dict = model(tgt, ctx)
                 loss = loss_dict["total"]
 
             scaler.scale(loss).backward()
@@ -348,11 +344,9 @@ def main():
                 pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
                 if revin is not None:
                     pilot_ctx = revin(pilot_ctx, mode="norm")
-                pilot_revin_stats = (revin.mean, revin.stdev) if revin is not None else None
                 es_result = model.find_optimal_stop_step(
                     pilot_ctx, num_samples=tcfg.num_samples,
                     safety_margin=tcfg.early_stop_safety_margin,
-                    revin_stats=pilot_revin_stats,
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
@@ -425,11 +419,9 @@ def main():
         pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
         if revin is not None:
             pilot_ctx = revin(pilot_ctx, mode="norm")
-        pilot_revin_stats = (revin.mean, revin.stdev) if revin is not None else None
         es_result = model.find_optimal_stop_step(
             pilot_ctx, num_samples=tcfg.num_samples,
             safety_margin=tcfg.early_stop_safety_margin,
-            revin_stats=pilot_revin_stats,
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")

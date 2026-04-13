@@ -1,17 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 from torch import Tensor
 from einops import rearrange
 
 from src.embeddings import PatchEmbedding, RotaryPositionalEmbedding
 
 
-# ── Transformer block with optional de-stationary attention ──────────────────
+# ── Transformer block ────────────────────────────────────────────────────────
 
 class ConditionBlock(nn.Module):
-    """Pre-norm transformer encoder block that accepts optional tau/delta."""
+    """Pre-norm transformer encoder block."""
 
     def __init__(self, d_model: int, n_heads: int, mlp_ratio: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -30,9 +29,7 @@ class ConditionBlock(nn.Module):
             nn.Dropout(dropout), nn.Linear(mlp_hidden, d_model), nn.Dropout(dropout),
         )
 
-    def forward(self, x: Tensor,
-                tau: Optional[Tensor] = None,
-                delta: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         B, L, D = x.shape
         h = self.norm1(x)
         qkv = self.qkv(h).reshape(B, L, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -40,11 +37,6 @@ class ConditionBlock(nn.Module):
         q, k = self.rope(q, k)
         scale = self.head_dim ** -0.5
         attn = (q @ k.transpose(-2, -1)) * scale
-
-        if tau is not None:
-            attn = attn * tau
-        if delta is not None:
-            attn = attn + delta
 
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
@@ -71,12 +63,9 @@ class ConditionEncoder(nn.Module):
         dropout: float = 0.1,
         channel_independent: bool = True,
         num_features: int = 1,
-        use_destationary: bool = False,
     ):
         super().__init__()
         self.channel_independent = channel_independent
-        self.use_destationary = use_destationary
-        self.n_heads = n_heads
         nf = 1 if channel_independent else num_features
         self.patch_emb = PatchEmbedding(patch_size, d_model, use_positional=True,
                                         num_features=nf)
@@ -85,17 +74,11 @@ class ConditionEncoder(nn.Module):
             ConditionBlock(d_model, n_heads, dropout=dropout)
             for _ in range(n_layers)
         ])
-        if use_destationary:
-            self.delta_proj = nn.Linear(n_heads, n_heads * self.num_patches)
 
-    def forward(self, x: Tensor,
-                tau: Optional[Tensor] = None,
-                delta: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         """
         Args:
             x:     [B, context_len, C]
-            tau:   optional [B_eff, H, 1, 1]
-            delta: optional [B_eff, H]
         Returns:
             CI: [B, C, num_patches, d_model]
             CD: [B, 1, num_patches, d_model]
@@ -104,13 +87,8 @@ class ConditionEncoder(nn.Module):
         x = rearrange(x, "b l c -> b c l")       # [B, C, L]
         h = self.patch_emb(x)                      # [B_eff, P, D]
 
-        # Project delta to sequence length
-        if delta is not None and self.use_destationary:
-            delta = self.delta_proj(delta)  # [B_eff, H * nP]
-            delta = delta.reshape(-1, self.n_heads, 1, self.num_patches)
-
         for block in self.blocks:
-            h = block(h, tau=tau, delta=delta)
+            h = block(h)
         if self.channel_independent:
             h = rearrange(h, "(b c) p d -> b c p d", b=B, c=C)
         else:

@@ -27,8 +27,6 @@ model:
   mlp_ratio: 4
   dropout: 0.1
 
-  denoiser_type: dit        # "dit" or "csdi"
-
   # Channel mode
   channel_independent: true  # true = per-channel; false = project [patch_size*C]→d_embed
 
@@ -43,9 +41,10 @@ model:
   beta_end: 0.1
   eta: 1.0                  # DDIM eta; 0 = deterministic
 
-  # De-stationary attention (Non-stationary Transformers, NeurIPS 2022)
-  # Only effective when use_revin is true and denoiser_type is "dit"
-  use_destationary: false
+  # Staged transform: "fft" (frequency filtering) or "ma" (repeated moving average)
+  transform_type: fft
+  ma_kernel_size: 3           # box-kernel width (only used when transform_type=ma)
+
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
