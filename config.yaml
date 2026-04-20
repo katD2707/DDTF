@@ -45,6 +45,10 @@ model:
   transform_type: fft
   ma_kernel_size: 3           # box-kernel width (only used when transform_type=ma)
 
+  # Self-conditioning
+  sc_rate: 0.4                # probability of applying self-conditioning during training
+  sc_aug_rate: 0.65           # probability of augmenting the self-conditioning signal
+
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:

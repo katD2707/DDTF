@@ -76,6 +76,10 @@ class ModelConfig:
     transform_type: Literal["fft", "ma"] = "fft"
     ma_kernel_size: int = 3  # box-kernel width for MA transform
 
+    # Self-conditioning
+    sc_rate: float = 0.4       # probability of applying self-conditioning during training
+    sc_aug_rate: float = 0.65  # probability of augmenting the self-conditioning signal
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Training

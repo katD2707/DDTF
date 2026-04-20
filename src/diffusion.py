@@ -144,6 +144,17 @@ class StagedFFT(nn.Module):
         x_recon = torch.fft.irfft(x_fft * mask, n=L, dim=1)
         return rearrange(x_recon, "(b v) l -> b l v", v=D)
 
+    def apply_incremental(self, x_k: Tensor, k: Tensor) -> Tensor:
+        """
+        Incremental transform: given x at stage k, produce x at stage k+1.
+
+        Removes the bottom (n_k - n_{k+1}) frequencies by magnitude from x_k,
+        keeping only the top n_{k+1} frequencies.
+        """
+        k_next = (k + 1).clamp(max=self.K)
+        return self.apply_stage(x_k, k_next)
+        
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Staged Moving-Average Smoothing
@@ -169,6 +180,9 @@ class StagedMA(nn.Module):
     def _precompute_kernels(self, K: int, ks: int):
         """Build the effective convolution kernel for each stage 1..K."""
         base = torch.ones(1, 1, ks, dtype=torch.float32) / ks
+        # The incremental kernel (k → k+1) is always the base kernel,
+        # since cumulative_{k+1} = conv(cumulative_k, base).
+        self.register_buffer("_inc_kernel", base)
         kernels = []
         eff = base.clone()
         for stage in range(1, K + 1):
@@ -213,6 +227,27 @@ class StagedMA(nn.Module):
 
         return rearrange(out, "(b v) l -> b l v", v=D)
 
+    def apply_incremental(self, x_k: Tensor, k: Tensor) -> Tensor:
+        """
+        Incremental transform: given x at stage k, produce x at stage k+1.
+
+        Applies a single base kernel convolution (one MA pass).
+        Since cumulative_{k+1} = conv(cumulative_k, base), convolving x_k
+        with base gives x_{k+1}.
+        """
+        B, L, D = x_k.shape
+        k_next = (k + 1).clamp(max=self.K)
+        # If already at max stage, return as-is
+        if (k_next == k).all():
+            return x_k
+
+        kernel = self._inc_kernel.to(x_k.device)  # [1, 1, ks]
+        pad = kernel.shape[-1] // 2
+        x_flat = rearrange(x_k, "b l v -> (b v) 1 l")
+        out = F.conv1d(x_flat, kernel, padding=pad)
+        out = out[:, 0, :L]
+        return rearrange(out, "(b v) l -> b l v", v=D)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Main Model: FFTDiffusion
@@ -254,6 +289,8 @@ class FFTDiffusion(nn.Module):
         num_features: int = 1,
         transform_type: str = "fft",
         ma_kernel_size: int = 3,
+        sc_rate: float = 0.4,
+        sc_aug_rate: float = 0.65,
     ):
         super().__init__()
         self.context_length = context_length
@@ -263,6 +300,13 @@ class FFTDiffusion(nn.Module):
         self.num_fft_stages = num_fft_stages
         self.eta = eta
         self.channel_independent = channel_independent
+        self.sc_rate = sc_rate
+        self.sc_aug_rate = sc_aug_rate
+        self.use_sc = sc_rate > 0
+
+        if self.use_sc:
+            from src.sc_augment import apply_sc_augmentation
+            self._apply_sc_augmentation = apply_sc_augmentation
 
         # Sub-modules
         self.condition_encoder = ConditionEncoder(
@@ -283,6 +327,7 @@ class FFTDiffusion(nn.Module):
             dropout=dropout,
             channel_independent=channel_independent,
             num_features=num_features,
+            use_sc=self.use_sc,
         )
 
         # Staged transform (FFT or MA)
@@ -352,6 +397,25 @@ class FFTDiffusion(nn.Module):
 
     # ── Training forward ─────────────────────────────────────────────────
 
+    def _prepare_sc_signal(self, x_k: Tensor, t: Tensor, augment: bool = False) -> Tensor:
+        """
+        Transform the model's prediction from x_k to x_{k+1} for self-conditioning.
+
+        Args:
+            x_k:     predicted stage-k signal [B, L, C]
+            t:       diffusion timesteps [B]
+            augment: whether to apply augmentation to the SC signal
+        Returns:
+            sc_signal: [B, L, C] — self-conditioning signal at stage k+1
+        """
+        k, _, _, _ = self._stage_info(t)
+        sc_signal = self.staged_transform.apply_incremental(x_k, k)
+
+        if augment and self.sc_aug_rate > 0 and torch.rand(1).item() < self.sc_aug_rate:
+            sc_signal = self._apply_sc_augmentation(sc_signal)
+
+        return sc_signal
+
     def forward(self, y: Tensor, context: Tensor):
         """
         Training step.
@@ -375,8 +439,17 @@ class FFTDiffusion(nn.Module):
         noise = torch.randn_like(y_target)
         y_t = self.q_sample(y_target, t, noise)
 
-        # Predict
-        y0_pred, delta_pred = self.denoiser(y_t, t, cond)
+        # Self-conditioning: with probability sc_rate, do a preliminary pass
+        sc_signal = None
+        if self.use_sc and torch.rand(1).item() < self.sc_rate:
+            with torch.no_grad():
+                y0_first, delta_first = self.denoiser(y_t, t, cond, sc_signal=None)
+                sc_signal = self._prepare_sc_signal(
+                    (y0_first + delta_first).detach(), t, augment=self.training
+                )
+
+        # Predict (with or without self-conditioning)
+        y0_pred, delta_pred = self.denoiser(y_t, t, cond, sc_signal=sc_signal)
         delta_target = y_k - y_target
 
         # Losses
@@ -437,13 +510,20 @@ class FFTDiffusion(nn.Module):
         all_scores: list = []
         all_steps: list = []
 
+        # Self-conditioning signal (accumulated across steps)
+        sc_signal = None
+
         for t_now, t_next in pairs:
             t_b = torch.full((B_eff,), t_now, device=device, dtype=torch.long)
             t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
 
-            y0_pred, delta_pred = self.denoiser(y_t, t_b, cond)
+            y0_pred, delta_pred = self.denoiser(y_t, t_b, cond, sc_signal=sc_signal)
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
             candidate = y0_pred + delta_pred
+
+            # Update self-conditioning signal for next step
+            if self.use_sc:
+                sc_signal = self._prepare_sc_signal(candidate, t_b, augment=False)
 
             # Collect scores for pilot calibration
             if return_scores:
@@ -546,4 +626,6 @@ class FFTDiffusion(nn.Module):
             num_features=cfg.num_features,
             transform_type=cfg.transform_type,
             ma_kernel_size=cfg.ma_kernel_size,
+            sc_rate=cfg.sc_rate,
+            sc_aug_rate=cfg.sc_aug_rate,
         )

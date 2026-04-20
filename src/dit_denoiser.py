@@ -6,7 +6,7 @@ conditioned on encoded context and diffusion timestep.
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange, repeat
 
-from src.embeddings import PatchEmbedding, TimestepEmbedding, RotaryPositionalEmbedding
+from src.embeddings import PatchEmbedding, TimestepEmbedding
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -33,35 +33,37 @@ class AdaLNBlock(nn.Module):
         head_dim = d_model // n_heads
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.kv_proj = nn.Linear(d_model, 2 * d_model)
         self.attn_drop = nn.Dropout(dropout)
         self.proj = nn.Linear(d_model, d_model)
-        self.rope = RotaryPositionalEmbedding(head_dim)
         mlp_hidden = d_model * mlp_ratio
         self.mlp = nn.Sequential(
             nn.Linear(d_model, mlp_hidden), nn.GELU(approximate="tanh"),
             nn.Dropout(dropout), nn.Linear(mlp_hidden, d_model), nn.Dropout(dropout),
         )
-        # 6 modulation outputs: shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp
+        # 6 modulation outputs: shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp
         self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model))
 
-    def forward(self, x: Tensor, c: Tensor) -> Tensor:
-        shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp = self.adaLN(c).chunk(6, dim=-1)
+    def forward(self, x: Tensor, c: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
+        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaLN(c).chunk(6, dim=-1)
 
-        # Self-attention
+        # Cross-attention: Q from x, K/V from ctx
         B, L, D = x.shape
-        h = modulate(self.norm1(x), shift_sa, scale_sa)
-        qkv = self.qkv(h).reshape(B, L, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = self.rope(q, k)
+        h = modulate(self.norm1(x), shift_attn, scale_attn)
+        q = self.q_proj(h).reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        kv_in = ctx if ctx is not None else h
+        S = kv_in.shape[1]
+        kv = self.kv_proj(kv_in).reshape(B, S, 2, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
         scale = self.head_dim ** -0.5
         attn = (q @ k.transpose(-2, -1)) * scale
 
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
-        sa_out = (attn @ v).transpose(1, 2).reshape(B, L, D)
-        sa_out = self.proj(sa_out)
-        x = x + gate_sa.unsqueeze(1) * sa_out
+        attn_out = (attn @ v).transpose(1, 2).reshape(B, L, D)
+        attn_out = self.proj(attn_out)
+        x = x + gate_attn.unsqueeze(1) * attn_out
 
         # MLP
         h = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -90,8 +92,8 @@ class DiTDenoiser(nn.Module):
     DiT-style denoiser.  Predicts (y_0_pred, delta_t_pred) for the FFT
     diffusion framework (f-DM).
 
-    The condition from the encoder is flattened and projected to match
-    the denoiser hidden dim, then concatenated to the patch tokens.
+    The condition from the encoder is projected per-patch and fed to the
+    transformer blocks via cross-attention.
     """
 
     def __init__(
@@ -107,6 +109,7 @@ class DiTDenoiser(nn.Module):
         dropout: float = 0.1,
         channel_independent: bool = True,
         num_features: int = 1,
+        use_sc: bool = False,
     ):
         super().__init__()
         self.prediction_length = prediction_length
@@ -115,16 +118,22 @@ class DiTDenoiser(nn.Module):
         self.channel_independent = channel_independent
         self.num_features = num_features
         self.n_heads = n_heads
+        self.use_sc = use_sc
 
-        d_embed = d_model // 2
         self.timestep_emb = TimestepEmbedding(d_model)
-        self.context_proj = nn.Linear(num_context_patches * d_model_condition, d_embed)
+        self.context_proj = nn.Linear(d_model_condition, d_model) if d_model_condition != d_model else nn.Identity()
 
         nf = 1 if channel_independent else num_features
-        self.patch_embedding = PatchEmbedding(patch_size, d_embed,
+        self.patch_embedding = PatchEmbedding(patch_size, d_model,
                                               use_positional=True, num_features=nf)
         out_patch = patch_size * nf
         self.num_target_patches = self.patch_embedding.compute_num_patches(prediction_length)
+
+        # Self-conditioning (optional)
+        if use_sc:
+            self.sc_patch_embedding = PatchEmbedding(patch_size, d_model,
+                                                     use_positional=True, num_features=nf)
+            self.input_proj = nn.Linear(d_model * 2, d_model)
 
         self.blocks = nn.ModuleList([
             AdaLNBlock(d_model, n_heads, mlp_ratio, dropout)
@@ -143,7 +152,11 @@ class DiTDenoiser(nn.Module):
                     nn.init.zeros_(m.bias)
         self.apply(_basic)
         nn.init.normal_(self.patch_embedding.projection.weight, std=0.02)
-        nn.init.normal_(self.context_proj.weight, std=0.02)
+        if self.use_sc:
+            nn.init.normal_(self.sc_patch_embedding.projection.weight, std=0.02)
+            nn.init.normal_(self.input_proj.weight, std=0.02)
+        if isinstance(self.context_proj, nn.Linear):
+            nn.init.normal_(self.context_proj.weight, std=0.02)
         nn.init.normal_(self.timestep_emb.mlp[0].weight, std=0.02)
         nn.init.normal_(self.timestep_emb.mlp[2].weight, std=0.02)
         for block in self.blocks:
@@ -160,36 +173,44 @@ class DiTDenoiser(nn.Module):
         yt: Tensor,
         t: Tensor,
         cond: Tensor,
+        sc_signal: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
-            yt:    noisy target [B, L, C]
-            t:     timesteps [B]
-            cond:  condition [B, C, P, D_cond] (CI) or [B, 1, P, D_cond] (CD)
+            yt:        noisy target [B, L, C]
+            t:         timesteps [B]
+            cond:      condition [B, C, P, D_cond] (CI) or [B, 1, P, D_cond] (CD)
+            sc_signal: self-conditioning signal [B, L, C] or None
         Returns:
             (y0_pred, delta_pred)  each [B, L, C]
         """
         B, L, C = yt.shape
 
         if self.channel_independent:
-            return self._forward_ci(yt, t, cond, B, L, C)
-        return self._forward_cd(yt, t, cond, B, L, C)
+            return self._forward_ci(yt, t, cond, B, L, C, sc_signal)
+        return self._forward_cd(yt, t, cond, B, L, C, sc_signal)
 
-    def _forward_ci(self, yt, t, cond, B, L, C):
+    def _forward_ci(self, yt, t, cond, B, L, C, sc_signal=None):
         yt_ci = rearrange(yt, "b l c -> b c l")
         t_rep = repeat(t, "b -> (b c)", c=C)
 
         h = self.patch_embedding(yt_ci)             # [B*C, P, d_embed]
-        num_patches = h.shape[1]
 
-        cond_flat = rearrange(cond, "b c p d -> (b c) (p d)")
-        cond_emb = self.context_proj(cond_flat)     # [B*C, d_embed]
-        cond_emb = repeat(cond_emb, "bc d -> bc p d", p=num_patches)
-        h = torch.cat([h, cond_emb], dim=-1)        # [B*C, P, d_model]
+        cond_seq = rearrange(cond, "b c p d -> (b c) p d")
+        cond_emb = self.context_proj(cond_seq)      # [B*C, P_ctx, d_model]
+
+        # Self-conditioning embedding (optional)
+        if self.use_sc:
+            if sc_signal is not None:
+                sc_ci = rearrange(sc_signal, "b l c -> b c l")
+                sc_emb = self.sc_patch_embedding(sc_ci)  # [B*C, P, d_model]
+            else:
+                sc_emb = torch.zeros_like(h)             # [B*C, P, d_model]
+            h = self.input_proj(torch.cat([h, sc_emb], dim=-1))
 
         c = self.timestep_emb(t_rep)                 # [B*C, d_model]
         for block in self.blocks:
-            h = block(h, c)
+            h = block(h, c, cond_emb)
 
         y0_out = self.final_layer(h, c).flatten(-2)[:, :L]
         delta_out = self.delta_head(h, c).flatten(-2)[:, :L]
@@ -200,22 +221,27 @@ class DiTDenoiser(nn.Module):
 
     # ── channel-dependent forward ─────────────────────────────────────────
 
-    def _forward_cd(self, yt, t, cond, B, L, C):
+    def _forward_cd(self, yt, t, cond, B, L, C, sc_signal=None):
         P = self.patch_size
         yt = rearrange(yt, "b l c -> b c l")
 
         h = self.patch_embedding(yt)               # [B, nP, d_embed]
-        num_patches = h.shape[1]
 
         cond_avg = cond.mean(dim=1)                        # [B, P_cond, D_cond]
-        cond_flat = cond_avg.reshape(B, -1)
-        cond_emb = self.context_proj(cond_flat)            # [B, d_embed]
-        cond_emb = cond_emb.unsqueeze(1).expand(-1, num_patches, -1)
-        h = torch.cat([h, cond_emb], dim=-1)               # [B, nP, d_model]
+        cond_emb = self.context_proj(cond_avg)             # [B, P_ctx, d_model]
+
+        # Self-conditioning embedding (optional)
+        if self.use_sc:
+            if sc_signal is not None:
+                sc_cd = rearrange(sc_signal, "b l c -> b c l")
+                sc_emb = self.sc_patch_embedding(sc_cd)  # [B, nP, d_embed]
+            else:
+                sc_emb = torch.zeros_like(h)             # [B, nP, d_embed]
+            h = self.input_proj(torch.cat([h, sc_emb], dim=-1))
 
         c = self.timestep_emb(t)
         for block in self.blocks:
-            h = block(h, c)
+            h = block(h, c, cond_emb)
 
         # [B, nP, P*C] → [B, L, C]
         y0_out = self.final_layer(h, c).reshape(B, -1, P, C)

@@ -121,6 +121,8 @@ def parse_args():
     parser.add_argument("--transform_type", type=str, default=None,
                         choices=["fft", "ma"])
     parser.add_argument("--ma_kernel_size", type=int, default=None)
+    parser.add_argument("--sc_rate", type=float, default=None)
+    parser.add_argument("--sc_aug_rate", type=float, default=None)
 
     # Training overrides
     parser.add_argument("--learning_rate", type=float, default=None)
