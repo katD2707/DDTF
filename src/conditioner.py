@@ -61,14 +61,9 @@ class ConditionEncoder(nn.Module):
         n_layers: int,
         n_heads: int,
         dropout: float = 0.1,
-        channel_independent: bool = True,
-        num_features: int = 1,
     ):
         super().__init__()
-        self.channel_independent = channel_independent
-        nf = 1 if channel_independent else num_features
-        self.patch_emb = PatchEmbedding(patch_size, d_model, use_positional=True,
-                                        num_features=nf)
+        self.patch_emb = PatchEmbedding(patch_size, d_model, use_positional=True)
         self.num_patches = self.patch_emb.compute_num_patches(context_length)
         self.blocks = nn.ModuleList([
             ConditionBlock(d_model, n_heads, dropout=dropout)
@@ -84,13 +79,10 @@ class ConditionEncoder(nn.Module):
             CD: [B, 1, num_patches, d_model]
         """
         B, L, C = x.shape
-        x = rearrange(x, "b l c -> b c l")       # [B, C, L]
-        h = self.patch_emb(x)                      # [B_eff, P, D]
+        x = rearrange(x, "b l c -> (b c) l")       # [B*C, L]
+        h = self.patch_emb(x)                      # [B*C, P, D]
 
         for block in self.blocks:
             h = block(h)
-        if self.channel_independent:
-            h = rearrange(h, "(b c) p d -> b c p d", b=B, c=C)
-        else:
-            h = h.unsqueeze(1)                          # [B, 1, P, D]
+        h = rearrange(h, "(b c) p d -> b c p d", b=B, c=C)
         return h

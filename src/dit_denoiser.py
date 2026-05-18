@@ -3,6 +3,8 @@ Simplified DiT-style denoiser for FFT diffusion.
 
 Predicts clean signal y_0 and degradation delta_t from noisy input,
 conditioned on encoded context and diffusion timestep.
+
+Block-diffusion mode follows BD3LMS (Arriaga-Carrasco et al., 2024)
 """
 
 import math
@@ -20,54 +22,120 @@ from src.embeddings import PatchEmbedding, TimestepEmbedding
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale) + shift
 
 
 # ── adaLN-Zero Transformer Block ─────────────────────────────────────────────
 
 class AdaLNBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_ratio: int = 4, dropout: float = 0.1):
+    """
+    adaLN-Zero transformer block.
+
+    When ``use_causal_block_attn=True`` a block-diffusion self-attention (SA)
+    sublayer is prepended before the cross-attention (CA) sublayer.
+    The SA operates on the full concatenated [y_t | y_kv] sequence (2P tokens)
+    using the pre-built BD3LMS-style ``block_diff_mask`` passed as ``attn_mask``.
+    Both SA and CA use torch SDPA.
+
+    adaLN outputs:
+      use_causal_block_attn=False : 6  (shift_ca, scale_ca, gate_ca,
+                                        shift_mlp, scale_mlp, gate_mlp)
+      use_causal_block_attn=True  : 9  (shift_sa, scale_sa, gate_sa + the 6 above)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        mlp_ratio: int = 4,
+        dropout: float = 0.1,
+        use_causal_block_attn: bool = False,
+    ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-        head_dim = d_model // n_heads
-        self.n_heads = n_heads
-        self.head_dim = head_dim
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.kv_proj = nn.Linear(d_model, 2 * d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.proj = nn.Linear(d_model, d_model)
+        self.use_causal_block_attn = use_causal_block_attn
+        self.n_heads  = n_heads
+        self.head_dim = d_model // n_heads
+        self.dropout  = dropout
+
+        # ── BD3LMS-style block self-attention sublayer ─────────────────────
+        if use_causal_block_attn:
+            self.norm_sa     = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+            self.sa_qkv_proj = nn.Linear(d_model, 3 * d_model)
+            self.sa_out_proj = nn.Linear(d_model, d_model)
+
+        # ── Cross-attention sublayer (history encoder context) ─────────────
+        self.norm1   = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.norm2   = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.ca_q_proj  = nn.Linear(d_model, d_model)
+        self.ca_kv_proj  = nn.Linear(d_model, 2*d_model)
+        self.proj    = nn.Linear(d_model, d_model)
         mlp_hidden = d_model * mlp_ratio
         self.mlp = nn.Sequential(
             nn.Linear(d_model, mlp_hidden), nn.GELU(approximate="tanh"),
             nn.Dropout(dropout), nn.Linear(mlp_hidden, d_model), nn.Dropout(dropout),
         )
-        # 6 modulation outputs: shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp
-        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model))
 
-    def forward(self, x: Tensor, c: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
-        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaLN(c).chunk(6, dim=-1)
+        # adaLN: 9 outputs when SA sublayer is present, else 6
+        n_mods = 9 if use_causal_block_attn else 6
+        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(d_model, n_mods * d_model))
 
-        # Cross-attention: Q from x, K/V from ctx
+    def forward(
+        self,
+        x: Tensor,
+        c: Tensor,
+        ctx: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Args:
+            x:         [B, L, D]   input patches
+                       (L = P in full mode; L = 2P in block mode)
+            c:         [B, L, D]   per-patch adaLN condition (timestep embedding)
+            ctx:       [B, S, D]   cross-attention context (history encoder)
+            attn_mask: [L, L] bool, True = allowed to attend (BD3LMS mask);
+                       None → unrestricted (full mode, SA sublayer absent)
+        """
         B, L, D = x.shape
-        h = modulate(self.norm1(x), shift_attn, scale_attn)
-        q = self.q_proj(h).reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        kv_in = ctx if ctx is not None else h
-        S = kv_in.shape[1]
-        kv = self.kv_proj(kv_in).reshape(B, S, 2, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
-        scale = self.head_dim ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale
+        mods = self.adaLN(c).chunk(9 if self.use_causal_block_attn else 6, dim=-1)
 
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
-        attn_out = (attn @ v).transpose(1, 2).reshape(B, L, D)
+        if self.use_causal_block_attn:
+            shift_sa, scale_sa, gate_sa, \
+            shift_ca, scale_ca, gate_ca, \
+            shift_mlp, scale_mlp, gate_mlp = mods
+
+            # ── Block SA: SDPA over full [y_t | y_kv] sequence ───────────
+            h   = modulate(self.norm_sa(x), shift_sa, scale_sa)
+            qkv = self.sa_qkv_proj(h).reshape(B, L, 3, self.n_heads, self.head_dim).transpose(1, 3) # each [B, H, 3, L, D_h]
+            sa_out = F.scaled_dot_product_attention(
+                qkv[:,:,0], qkv[:,:,1], qkv[:,:,2],
+                attn_mask=attn_mask,                     # [L, L] bool → broadcasts
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+            )
+            sa_out = sa_out.transpose(1, 2).reshape(B, L, D)
+            sa_out = self.sa_out_proj(sa_out)
+            x = x + gate_sa * sa_out
+        else:
+            shift_ca, scale_ca, gate_ca, shift_mlp, scale_mlp, gate_mlp = mods
+
+        # ── Cross-attention to history encoder (SDPA) ──────────────────────
+        h     = modulate(self.norm1(x), shift_ca, scale_ca)
+        q     = self.ca_q_proj(h).reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        kv_in = ctx if ctx is not None else h
+        S     = kv_in.shape[1]
+        kv    = self.ca_kv_proj(kv_in).reshape(B, S, 2, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        attn_out = F.scaled_dot_product_attention(
+            q, kv[0], kv[1],
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         attn_out = self.proj(attn_out)
-        x = x + gate_attn.unsqueeze(1) * attn_out
+        x = x + gate_ca * attn_out
 
         # MLP
         h = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(h)
+        x = x + gate_mlp * self.mlp(h)
         return x
 
 
@@ -98,8 +166,7 @@ class DiTDenoiser(nn.Module):
 
     def __init__(
         self,
-        prediction_length: int,
-        num_context_patches: int,
+        max_prediction_length: int,
         patch_size: int,
         d_model: int,
         d_model_condition: int,
@@ -107,42 +174,103 @@ class DiTDenoiser(nn.Module):
         n_heads: int,
         mlp_ratio: int = 4,
         dropout: float = 0.1,
-        channel_independent: bool = True,
-        num_features: int = 1,
-        use_sc: bool = False,
+        use_causal_block_attn: bool = False,
+        block_size: Optional[int] = 24,
     ):
         super().__init__()
-        self.prediction_length = prediction_length
+        self.max_prediction_length = max_prediction_length
         self.patch_size = patch_size
         self.d_model = d_model
-        self.channel_independent = channel_independent
-        self.num_features = num_features
         self.n_heads = n_heads
-        self.use_sc = use_sc
+        self.use_causal_block_attn = use_causal_block_attn
 
-        self.timestep_emb = TimestepEmbedding(d_model)
+        self.timestep_emb = TimestepEmbedding(d_model, patching=True, patch_size=patch_size)
         self.context_proj = nn.Linear(d_model_condition, d_model) if d_model_condition != d_model else nn.Identity()
 
-        nf = 1 if channel_independent else num_features
-        self.patch_embedding = PatchEmbedding(patch_size, d_model,
-                                              use_positional=True, num_features=nf)
-        out_patch = patch_size * nf
-        self.num_target_patches = self.patch_embedding.compute_num_patches(prediction_length)
+        self.patch_embedding = PatchEmbedding(patch_size, d_model, use_positional=True)
+        self.num_target_patches = self.patch_embedding.compute_num_patches(max_prediction_length)
 
-        # Self-conditioning (optional)
-        if use_sc:
-            self.sc_patch_embedding = PatchEmbedding(patch_size, d_model,
-                                                     use_positional=True, num_features=nf)
-            self.input_proj = nn.Linear(d_model * 2, d_model)
+        if use_causal_block_attn:
+            assert block_size is not None and block_size % patch_size == 0, (
+                "block_size must be provided and divisible by patch_size for block diffusion mode")
+            self.block_size = block_size
+            # BD3LMS block_diff_mask: [2P, 2P] bool, True = attend
+            self.register_buffer(
+                "block_diff_mask",
+                self._build_block_diff_mask(self.num_target_patches, block_size // patch_size),
+                persistent=False,
+            )
 
         self.blocks = nn.ModuleList([
-            AdaLNBlock(d_model, n_heads, mlp_ratio, dropout)
+            AdaLNBlock(d_model, n_heads, mlp_ratio, dropout,
+                       use_causal_block_attn=use_causal_block_attn)
             for _ in range(n_layers)
         ])
-        self.final_layer = FinalLayer(d_model, out_patch)
-        self.delta_head = FinalLayer(d_model, out_patch)
+        self.final_layer = FinalLayer(d_model, patch_size)
+        self.delta_head  = FinalLayer(d_model, patch_size)
 
         self._init_weights()
+
+    # ── BD3LMS-style attention mask ───────────────────────────────────────
+
+    @staticmethod
+    def _build_block_diff_mask(num_patches: int, block_size: int) -> Tensor:
+        """
+        Build the BD3LMS-style block-diffusion attention mask.
+
+        Combined sequence: 2*num_patches tokens.
+          positions   0 .. P-1   → y_t  (noisy query half)
+          positions   P .. 2P-1  → y_kv (clean/noisy context half)
+        block_size: number of patches per block (ppb = block_size // patch_size).
+
+        Each patch index is mapped to a block via ``patch_idx // block_size``.
+
+        Three component masks (BD3LMS notation):
+          M_BD  – block diagonal: patches in the same block and same half
+                  attend to each other
+          M_OBC – offset block-causal: y_t patches in block b attend to
+                  y_kv patches in blocks < b
+          M_BC  – block-causal: y_kv patches in block b attend to y_kv
+                  patches in blocks ≤ b
+
+        Returns a bool tensor [2P, 2P], True = allowed to attend.
+        """
+        n     = num_patches
+        total = 2 * n
+        q_idx  = torch.arange(total).unsqueeze(1)   # [2P, 1]
+        kv_idx = torch.arange(total).unsqueeze(0)   # [1, 2P]
+
+        x0_flag_q  = q_idx  >= n   # True → y_kv half
+        x0_flag_kv = kv_idx >= n
+
+        # Patch index within its own half (0..P-1), then floor-divide by block_size
+        patch_q  = torch.where(x0_flag_q,  q_idx  - n, q_idx)
+        patch_kv = torch.where(x0_flag_kv, kv_idx - n, kv_idx)
+        block_q  = patch_q  // block_size
+        block_kv = patch_kv // block_size
+
+        m_bd  = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+        m_obc = (block_q >  block_kv) & x0_flag_kv & ~x0_flag_q
+        m_bc  = (block_q >= block_kv) & x0_flag_kv &  x0_flag_q
+
+        return m_bd | m_obc | m_bc   # True = can attend
+
+    @staticmethod
+    def _build_block_causal_mask(num_patches: int, ppb: int) -> Tensor:
+        """
+        Block-causal attention mask for sample mode.
+
+        Mirrors BD3LMS `sample_mode=True`: the model sees only the
+        accumulated single sequence 0..b_end.  Token i may attend to
+        token j iff block(i) >= block(j)  (lower-triangular at block
+        granularity).  This is the lower-right ``M_BC`` quadrant of the
+        full training mask.  [num_patches, num_patches] bool.
+        """
+        q_idx = torch.arange(num_patches).unsqueeze(1)  # [P, 1]
+        k_idx = torch.arange(num_patches).unsqueeze(0)  # [1, P]
+        return (q_idx // ppb) >= (k_idx // ppb)
+
+    # ── Weight initialisation ─────────────────────────────────────────────
 
     def _init_weights(self):
         def _basic(m):
@@ -152,9 +280,6 @@ class DiTDenoiser(nn.Module):
                     nn.init.zeros_(m.bias)
         self.apply(_basic)
         nn.init.normal_(self.patch_embedding.projection.weight, std=0.02)
-        if self.use_sc:
-            nn.init.normal_(self.sc_patch_embedding.projection.weight, std=0.02)
-            nn.init.normal_(self.input_proj.weight, std=0.02)
         if isinstance(self.context_proj, nn.Linear):
             nn.init.normal_(self.context_proj.weight, std=0.02)
         nn.init.normal_(self.timestep_emb.mlp[0].weight, std=0.02)
@@ -162,6 +287,10 @@ class DiTDenoiser(nn.Module):
         for block in self.blocks:
             nn.init.zeros_(block.adaLN[-1].weight)
             nn.init.zeros_(block.adaLN[-1].bias)
+            if block.use_causal_block_attn:
+                nn.init.xavier_uniform_(block.sa_qkv_proj.weight)
+                nn.init.zeros_(block.sa_out_proj.weight)
+                nn.init.zeros_(block.sa_out_proj.bias)
         for head in [self.final_layer, self.delta_head]:
             nn.init.zeros_(head.adaLN[-1].weight)
             nn.init.zeros_(head.adaLN[-1].bias)
@@ -170,84 +299,57 @@ class DiTDenoiser(nn.Module):
 
     def forward(
         self,
-        yt: Tensor,
+        input: Tensor,
         t: Tensor,
         cond: Tensor,
-        sc_signal: Optional[Tensor] = None,
+        sample_mode: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
-            yt:        noisy target [B, L, C]
-            t:         timesteps [B]
-            cond:      condition [B, C, P, D_cond] (CI) or [B, 1, P, D_cond] (CD)
-            sc_signal: self-conditioning signal [B, L, C] or None
+            input:       [B, L, C]  where
+                           training / full mode  → L = max_prediction_length
+                           block training        → L = 2 * max_prediction_length
+                                                    (cat of y_t | y_kv halves)
+                           sample_mode           → L = b_end  (growing window)
+            t:           [B, L]  per-position timesteps; encoding mirrors L
+            cond:        [B, C, P_ctx, D_cond]  encoder output
+            sample_mode: if True, use BD3LMS single-window block-causal mask
+                         instead of the doubled training mask.
         Returns:
-            (y0_pred, delta_pred)  each [B, L, C]
+            (y0_pred, delta_pred) each [B, L_out, C]
+              training/full: L_out = max_prediction_length (y_t half only)
+              sample_mode:   L_out = b_end (full window; caller slices [b_start:b_end])
         """
-        B, L, C = yt.shape
+        B, L, C = input.shape
 
-        if self.channel_independent:
-            return self._forward_ci(yt, t, cond, B, L, C, sc_signal)
-        return self._forward_cd(yt, t, cond, B, L, C, sc_signal)
+        t_rep = repeat(t, "b l -> (b c) l", c=C)
+        h = self.patch_embedding(input)  # [B*C, P_in, D]
+        cond_emb = self.context_proj(rearrange(cond, "b c p d -> (b c) p d"))
+        c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
 
-    def _forward_ci(self, yt, t, cond, B, L, C, sc_signal=None):
-        yt_ci = rearrange(yt, "b l c -> b c l")
-        t_rep = repeat(t, "b -> (b c)", c=C)
-
-        h = self.patch_embedding(yt_ci)             # [B*C, P, d_embed]
-
-        cond_seq = rearrange(cond, "b c p d -> (b c) p d")
-        cond_emb = self.context_proj(cond_seq)      # [B*C, P_ctx, d_model]
-
-        # Self-conditioning embedding (optional)
-        if self.use_sc:
-            if sc_signal is not None:
-                sc_ci = rearrange(sc_signal, "b l c -> b c l")
-                sc_emb = self.sc_patch_embedding(sc_ci)  # [B*C, P, d_model]
+        if self.use_causal_block_attn:
+            ppb = self.block_size // self.patch_size
+            if sample_mode:
+                # BD3LMS sample_mode: single growing window [0..b_end]
+                # → block-causal mask (lower-right M_BC quadrant of training mask)
+                P_in = h.shape[1]
+                attn_mask = self._build_block_causal_mask(P_in, ppb).to(h.device)
             else:
-                sc_emb = torch.zeros_like(h)             # [B*C, P, d_model]
-            h = self.input_proj(torch.cat([h, sc_emb], dim=-1))
+                # Training: doubled [y_t | y_kv] sequence → full BD3LMS mask
+                P_half = h.shape[1] // 2
+                if P_half != self.num_target_patches:
+                    attn_mask = self._build_block_diff_mask(P_half, ppb).to(h.device)
+                else:
+                    attn_mask = self.block_diff_mask
+        else:
+            attn_mask = None
 
-        c = self.timestep_emb(t_rep)                 # [B*C, d_model]
         for block in self.blocks:
-            h = block(h, c, cond_emb)
+            h = block(h, c, cond_emb, attn_mask=attn_mask)
 
         y0_out = self.final_layer(h, c).flatten(-2)[:, :L]
         delta_out = self.delta_head(h, c).flatten(-2)[:, :L]
 
         y0_out = rearrange(y0_out, "(b c) l -> b l c", b=B, c=C)
         delta_out = rearrange(delta_out, "(b c) l -> b l c", b=B, c=C)
-        return y0_out, delta_out
-
-    # ── channel-dependent forward ─────────────────────────────────────────
-
-    def _forward_cd(self, yt, t, cond, B, L, C, sc_signal=None):
-        P = self.patch_size
-        yt = rearrange(yt, "b l c -> b c l")
-
-        h = self.patch_embedding(yt)               # [B, nP, d_embed]
-
-        cond_avg = cond.mean(dim=1)                        # [B, P_cond, D_cond]
-        cond_emb = self.context_proj(cond_avg)             # [B, P_ctx, d_model]
-
-        # Self-conditioning embedding (optional)
-        if self.use_sc:
-            if sc_signal is not None:
-                sc_cd = rearrange(sc_signal, "b l c -> b c l")
-                sc_emb = self.sc_patch_embedding(sc_cd)  # [B, nP, d_embed]
-            else:
-                sc_emb = torch.zeros_like(h)             # [B, nP, d_embed]
-            h = self.input_proj(torch.cat([h, sc_emb], dim=-1))
-
-        c = self.timestep_emb(t)
-        for block in self.blocks:
-            h = block(h, c, cond_emb)
-
-        # [B, nP, P*C] → [B, L, C]
-        y0_out = self.final_layer(h, c).reshape(B, -1, P, C)
-        y0_out = y0_out.reshape(B, -1, C)[:, :L, :]
-
-        delta_out = self.delta_head(h, c).reshape(B, -1, P, C)
-        delta_out = delta_out.reshape(B, -1, C)[:, :L, :]
-
         return y0_out, delta_out

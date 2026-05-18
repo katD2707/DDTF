@@ -62,32 +62,26 @@ class RotaryPositionalEmbedding(nn.Module):
 
 class PatchEmbedding(nn.Module):
     def __init__(self, patch_size: int = 24, d_model: int = 128,
-                 use_positional: bool = True, num_features: int = 1):
+                 use_positional: bool = True):
         super().__init__()
         self.patch_size = patch_size
         self.stride = patch_size
-        self.num_features = num_features
-        self.projection = nn.Linear(patch_size * num_features, d_model, bias=False)
+        self.projection = nn.Linear(patch_size, d_model, bias=False)
         self.padding_layer = nn.ReplicationPad1d((0, patch_size))
         self.pos_emb = PositionalEmbedding(d_model) if use_positional else None
 
     def forward(self, x: Tensor) -> Tensor:
         """
-        Channel-independent (num_features=1):
-            x: [B*C, L] or [B, C, L]  →  [B*C, num_patches, d_model]
-        Channel-dependent (num_features>1):
-            x: [B, L, C]  →  [B, num_patches, d_model]
+            x: [B*C, L] or [B, L, C]  →  [B*C, num_patches, d_model]
         """
         if x.dim() == 3:
-            B, C, L = x.shape
-            x = rearrange(x, "b c l -> (b c) l")
+            B, L, C = x.shape
+            x = rearrange(x, "b l c -> (b c) l")
         else:
             L = x.shape[-1]
         if (L - self.patch_size) % self.stride != 0:
             x = self.padding_layer(x.unsqueeze(1)).squeeze(1)
         x = x.unfold(-1, self.patch_size, self.stride)  # [B*C, N, P]
-        if self.num_features > 1:
-            x = rearrange(x, "(b c) p d -> b p (c d)", c=self.num_features)
         x = self.projection(x)
         if self.pos_emb is not None:
             x = x + self.pos_emb(x)
@@ -100,7 +94,7 @@ class PatchEmbedding(nn.Module):
 # ── Timestep Embedding ───────────────────────────────────────────────────────
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, hidden_size: int, freq_dim: int = 256):
+    def __init__(self, hidden_size: int, freq_dim: int = 256, patching: bool = False, patch_size: int = 24):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(freq_dim, hidden_size),
@@ -108,13 +102,25 @@ class TimestepEmbedding(nn.Module):
             nn.Linear(hidden_size, hidden_size),
         )
         self.freq_dim = freq_dim
+        self.patching = patching
+        self.patch_size = self.stride = patch_size
 
     @staticmethod
     def sinusoidal(t: Tensor, dim: int) -> Tensor:
         half = dim // 2
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
-        args = t[:, None].float() * freqs[None, :]
+        args = t[..., None].float() * freqs[None, ...]
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, t: Tensor) -> Tensor:
+        if self.patching:
+            if t.dim() == 3:
+                t = rearrange(t, "b l c -> (b c) l")
+            else:
+                L = t.shape[-1]
+            if (L - self.patch_size) % self.stride != 0:
+                raise ValueError(f"Input length {L} is not compatible with patch size {self.patch_size}, select other patch size.") 
+            t = t.unfold(-1, self.patch_size, self.stride)  # [B*C, N, P]
+            t = t.float().mean(dim=-1)  # [B*C, N]
+
         return self.mlp(self.sinusoidal(t, self.freq_dim))

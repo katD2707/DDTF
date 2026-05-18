@@ -53,6 +53,9 @@ def evaluate(
     revin: Optional[RevIN] = None,
     num_samples: int = 1,
     stop_step: Optional[int] = None,
+    sampling_stride: int = 1,
+    use_early_stop: bool = False,
+    early_stop_safety_margin: int = 0,
 ) -> dict:
     """
     Evaluate model on a dataloader.  When RevIN is provided the context
@@ -67,7 +70,10 @@ def evaluate(
         if revin is not None:
             ctx = revin(ctx, mode="norm")
 
-        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step)
+        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
+                             sampling_stride=sampling_stride,
+                             use_early_stop=use_early_stop,
+                             early_stop_safety_margin=early_stop_safety_margin)
 
         if revin is not None:
             pred = revin(pred, mode="denorm")
@@ -108,7 +114,6 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--use_revin", action="store_true", default=None)
     parser.add_argument("--no_revin", dest="use_revin", action="store_false")
-    parser.add_argument("--channel_independent", action="store_true", default=None)
     parser.add_argument("--num_diffusion_steps", type=int, default=None)
     parser.add_argument("--num_sampling_steps", type=int, default=None)
     parser.add_argument("--num_fft_stages", type=int, default=None)
@@ -121,8 +126,13 @@ def parse_args():
     parser.add_argument("--transform_type", type=str, default=None,
                         choices=["fft", "ma"])
     parser.add_argument("--ma_kernel_size", type=int, default=None)
-    parser.add_argument("--sc_rate", type=float, default=None)
-    parser.add_argument("--sc_aug_rate", type=float, default=None)
+    # Block diffusion
+    parser.add_argument("--block_diffusion_mode", type=str, default=None,
+                        choices=["full", "fixed"])
+    parser.add_argument("--block_size", type=int, default=None)
+    parser.add_argument("--block_noised_prev_prob", type=float, default=None)
+    parser.add_argument("--block_kv_mode", type=str, default=None,
+                        choices=["noised_prev", "predicted_clean_prev"])
 
     # Training overrides
     parser.add_argument("--learning_rate", type=float, default=None)
@@ -141,11 +151,11 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--use_early_stop", action="store_true", default=None)
-    parser.add_argument("--no_early_stop", dest="use_early_stop",
-                        action="store_false")
     parser.add_argument("--num_pilot_samples", type=int, default=None)
     parser.add_argument("--early_stop_safety_margin", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=None)
+    parser.add_argument("--sampling_stride", type=int, default=None,
+                        help="Staggered block sampler stride; 1 = sequential")
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--eval_interval", type=int, default=None)
     parser.add_argument("--save_interval", type=int, default=None)
@@ -194,6 +204,7 @@ def main():
         context_length=mcfg.context_length,
         prediction_length=mcfg.prediction_length,
         target_col=dcfg.target_col,
+        perturbation_cfg=cfg.perturbation,
     )
     mcfg.num_features = train_ds.num_channels
     print(f"Data: {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test  "
@@ -341,7 +352,7 @@ def main():
                 ema.apply_shadow()
 
             stop_step = None
-            if tcfg.use_early_stop:
+            if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
                 pilot_ctx, _ = next(iter(val_loader))
                 pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
                 if revin is not None:
@@ -354,7 +365,10 @@ def main():
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
 
             metrics = evaluate(model, val_loader, device, revin=revin,
-                               num_samples=tcfg.num_samples, stop_step=stop_step)
+                               num_samples=tcfg.num_samples, stop_step=stop_step,
+                               sampling_stride=tcfg.sampling_stride,
+                               use_early_stop=tcfg.use_early_stop,
+                               early_stop_safety_margin=tcfg.early_stop_safety_margin)
             print(f"  ↳ Val  MSE={metrics['mse']:.4f}  MAE={metrics['mae']:.4f}  RMSE={metrics['rmse']:.4f}")
 
             if metrics["mse"] < best_val_mse:
@@ -416,7 +430,7 @@ def main():
         ema.apply_shadow()
 
     stop_step = None
-    if tcfg.use_early_stop:
+    if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
         pilot_ctx, _ = next(iter(val_loader))
         pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
         if revin is not None:
@@ -429,7 +443,10 @@ def main():
         print(f"Early stop calibrated: stop_step={stop_step}")
 
     test_metrics = evaluate(model, test_loader, device, revin=revin,
-                            num_samples=tcfg.num_samples, stop_step=stop_step)
+                            num_samples=tcfg.num_samples, stop_step=stop_step,
+                            sampling_stride=tcfg.sampling_stride,
+                            use_early_stop=tcfg.use_early_stop,
+                            early_stop_safety_margin=tcfg.early_stop_safety_margin)
     print(f"\nTest  MSE={test_metrics['mse']:.4f}  MAE={test_metrics['mae']:.4f}  "
           f"RMSE={test_metrics['rmse']:.4f}")
 

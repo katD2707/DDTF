@@ -11,6 +11,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
 
+from src.perturbation import apply_perturbations
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Standard benchmark split definitions (fixed indices, no ratios)
@@ -117,6 +119,7 @@ def load_csv_dataset(
     prediction_length: int = 96,
     stride: int = 1,
     target_col: Optional[str] = None,
+    perturbation_cfg=None,
 ):
     """
     Load a CSV file and return train / val / test datasets.
@@ -133,6 +136,12 @@ def load_csv_dataset(
         prediction_length: Forecast horizon length.
         stride: Step between consecutive sliding windows.
         target_col: If given, only this column is kept (univariate).
+        perturbation_cfg: Optional ``PerturbationConfig`` instance.  When
+            ``perturbation_cfg.enabled`` is ``True``, the specified
+            perturbation types (Algorithms 1–4 from SEER Appendix B) are
+            applied to the raw *training* split only, before
+            ``StandardScaler`` fitting.  Validation and test splits are
+            never perturbed.
     """
     df = pd.read_csv(csv_path)
     if "date" in df.columns:
@@ -159,6 +168,28 @@ def load_csv_dataset(
     train_data = data[splits["train"][0] : splits["train"][1]]
     val_data   = data[splits["val"][0]   : splits["val"][1]]
     test_data  = data[splits["test"][0]  : splits["test"][1]]
+
+    # ── Apply training-only data perturbation (SEER Appendix B) ──────────
+    if (
+        perturbation_cfg is not None
+        and perturbation_cfg.enabled
+        and perturbation_cfg.types
+    ):
+        train_data = apply_perturbations(
+            train_data,
+            types=perturbation_cfg.types,
+            noise_ratio=perturbation_cfg.noise_ratio,
+            noise_scale=perturbation_cfg.noise_scale,
+            cont_anomaly_ratio=perturbation_cfg.cont_anomaly_ratio,
+            cont_segment_len=perturbation_cfg.cont_segment_len,
+            outlier_ratio=perturbation_cfg.outlier_ratio,
+            anomaly_scale=perturbation_cfg.anomaly_scale,
+            missing_ratio=perturbation_cfg.missing_ratio,
+            missing_segment_len=perturbation_cfg.missing_segment_len,
+            num_shift_segments=perturbation_cfg.num_shift_segments,
+            shift_scale=perturbation_cfg.shift_scale,
+            seed=perturbation_cfg.seed,
+        )
 
     train_ds = TimeSeriesDataset(train_data, context_length, prediction_length, stride)
     val_ds   = TimeSeriesDataset(val_data,   context_length, prediction_length, stride, scaler=train_ds.scaler)

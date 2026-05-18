@@ -10,6 +10,7 @@ Reference: f-DM (Gu et al., 2022) — arXiv:2210.04955
 
 import math
 from typing import Optional, Tuple
+import random
 
 import torch
 import torch.nn as nn
@@ -267,7 +268,7 @@ class FFTDiffusion(nn.Module):
     def __init__(
         self,
         context_length: int = 96,
-        prediction_length: int = 96,
+        max_prediction_length: int = 1024,
         patch_size: int = 24,
         d_model_encoder: int = 128,
         d_model_denoiser: int = 128,
@@ -285,39 +286,49 @@ class FFTDiffusion(nn.Module):
         stage_schedule: str = "linear",
         topk_schedule: str = "linear",
         eta: float = 1.0,
-        channel_independent: bool = True,
-        num_features: int = 1,
         transform_type: str = "fft",
         ma_kernel_size: int = 3,
-        sc_rate: float = 0.4,
-        sc_aug_rate: float = 0.65,
+        # Block diffusion
+        block_diffusion_mode: str = "full",
+        block_size: Optional[int] = None,
+        block_noised_prev_prob: float = 0.5,
+        block_kv_mode: str = "noised_prev",
     ):
         super().__init__()
         self.context_length = context_length
-        self.prediction_length = prediction_length
+        self.max_prediction_length = max_prediction_length
         self.num_diffusion_steps = num_diffusion_steps
         self.num_sampling_steps = num_sampling_steps
         self.num_fft_stages = num_fft_stages
         self.eta = eta
-        self.channel_independent = channel_independent
-        self.sc_rate = sc_rate
-        self.sc_aug_rate = sc_aug_rate
-        self.use_sc = sc_rate > 0
+        self.patch_size = patch_size
+        self.transform_type = transform_type
+        self._topk_schedule = topk_schedule
+        self.causal = block_diffusion_mode != "full"
 
-        if self.use_sc:
-            from src.sc_augment import apply_sc_augmentation
-            self._apply_sc_augmentation = apply_sc_augmentation
+        # ── Block diffusion configuration ───────────────────────────────────
+        assert block_diffusion_mode in ("full", "fixed"), (
+            f"Unknown block_diffusion_mode: {block_diffusion_mode}")
+        self.block_diffusion_mode = block_diffusion_mode
+        self._fixed_block_size = block_size or patch_size
+        self.block_noised_prev_prob = block_noised_prev_prob
+        assert block_kv_mode in ("noised_prev", "predicted_clean_prev"), (
+            f"Unknown block_kv_mode: {block_kv_mode}")
+        self.block_kv_mode = block_kv_mode
+
+        if block_diffusion_mode == "fixed":
+            assert max_prediction_length % self._fixed_block_size == 0, (
+                f"max_prediction_length ({max_prediction_length}) must be divisible by block_size ({self._fixed_block_size})")
+            assert self._fixed_block_size % patch_size == 0, (
+                f"block_size ({self._fixed_block_size}) must be divisible by patch_size ({patch_size})")
+        self.block_size = self._get_block_size()
 
         # Sub-modules
         self.condition_encoder = ConditionEncoder(
             context_length, patch_size, d_model_encoder, n_encoder_layers, n_heads, dropout,
-            channel_independent=channel_independent, num_features=num_features,
         )
-        num_ctx_patches = self.condition_encoder.num_patches
-
         self.denoiser = DiTDenoiser(
-            prediction_length=prediction_length,
-            num_context_patches=num_ctx_patches,
+            max_prediction_length=max_prediction_length,
             patch_size=patch_size,
             d_model=d_model_denoiser,
             d_model_condition=d_model_encoder,
@@ -325,16 +336,17 @@ class FFTDiffusion(nn.Module):
             n_heads=n_heads,
             mlp_ratio=mlp_ratio,
             dropout=dropout,
-            channel_independent=channel_independent,
-            num_features=num_features,
-            use_sc=self.use_sc,
+            use_causal_block_attn=self.causal,
+            block_size=self.block_size if self.causal else None,
         )
 
-        # Staged transform (FFT or MA)
+        # ── Staged transform ──────────────────────────────────────────────────
         if transform_type == "ma":
             self.staged_transform = StagedMA(K=num_fft_stages, kernel_size=ma_kernel_size)
         else:
-            self.staged_transform = StagedFFT(K=num_fft_stages, seq_len=prediction_length, schedule=topk_schedule)
+            self.staged_transform = StagedFFT(
+                K=num_fft_stages, seq_len=self.block_size, schedule=topk_schedule)
+
         boundaries = make_stage_schedule(num_fft_stages, num_diffusion_steps, stage_schedule)
         self.register_buffer("stage_boundaries", boundaries)
 
@@ -365,6 +377,32 @@ class FFTDiffusion(nn.Module):
         reg("post_coef1", betas * ac_prev.sqrt() / (1 - ac))
         reg("post_coef2", (1 - ac_prev) * alphas.sqrt() / (1 - ac))
 
+    # ── Block diffusion helpers ───────────────────────────────────────────
+
+    def _get_block_size(self) -> int:
+        """Return the block size for the current batch."""
+        # "full"  → seq_len = prediction_length  (original)
+        # "fixed" → seq_len = block_size         (per-block transforms)
+        if self.block_diffusion_mode == "fixed":
+            return self._fixed_block_size
+        return self.max_prediction_length
+
+    def q_sample(self, y0: Tensor, t: Tensor, noise: Optional[Tensor] = None) -> Tensor:
+        """
+        q_sample with per-position (per-block) diffusion timestep.
+
+        Args:
+            y0:    [B, L, C]   clean (degraded) signal
+            t:     [B, L]      integer timestep per position
+            noise: [B, L, C]
+        Returns:
+            y_t:   [B, L, C]
+        """
+        noise = default(noise, lambda: torch.randn_like(y0))
+        sqrt_ac    = self.sqrt_ac[t]     # [B, L]
+        sqrt_1m_ac = self.sqrt_1m_ac[t]  # [B, L]
+        return sqrt_ac.unsqueeze(-1) * y0 + sqrt_1m_ac.unsqueeze(-1) * noise
+
     # ── Stage info ────────────────────────────────────────────────────────
 
     def _stage_info(self, t: Tensor):
@@ -386,72 +424,89 @@ class FFTDiffusion(nn.Module):
         x_t = (1 - w) * x_k + w * x_k1
         return x_t, x_k
 
-    # ── q-sample (add Gaussian noise) ────────────────────────────────────
-
-    def q_sample(self, y0: Tensor, t: Tensor, noise: Optional[Tensor] = None):
-        noise = default(noise, lambda: torch.randn_like(y0))
-        return extract(self.sqrt_ac, t, y0.shape) * y0 + extract(self.sqrt_1m_ac, t, y0.shape) * noise
-
     def _noise_from_y0(self, yt, t, y0):
         return (extract(self.sqrt_recip_ac, t, yt.shape) * yt - y0) / extract(self.sqrt_recipm1_ac, t, yt.shape)
 
     # ── Training forward ─────────────────────────────────────────────────
 
-    def _prepare_sc_signal(self, x_k: Tensor, t: Tensor, augment: bool = False) -> Tensor:
-        """
-        Transform the model's prediction from x_k to x_{k+1} for self-conditioning.
-
-        Args:
-            x_k:     predicted stage-k signal [B, L, C]
-            t:       diffusion timesteps [B]
-            augment: whether to apply augmentation to the SC signal
-        Returns:
-            sc_signal: [B, L, C] — self-conditioning signal at stage k+1
-        """
-        k, _, _, _ = self._stage_info(t)
-        sc_signal = self.staged_transform.apply_incremental(x_k, k)
-
-        if augment and self.sc_aug_rate > 0 and torch.rand(1).item() < self.sc_aug_rate:
-            sc_signal = self._apply_sc_augmentation(sc_signal)
-
-        return sc_signal
-
     def forward(self, y: Tensor, context: Tensor):
         """
-        Training step.
+        Training step — block-diffusion aware.
 
-        Args:
-            y:       target  [B, pred_len, C]
-            context: history [B, ctx_len, C]
-        Returns:
-            loss_dict with keys 'total', 'stage', 'degrad'
+        In "full" mode this is identical to the original single-block behaviour.
+        In "fixed" mode the prediction sequence is split into
+        ``num_blocks`` blocks; each block gets an independently sampled
+        diffusion timestep.  With 50 % probability the KV source for the
+        causal self-attention is the *noisy* y_t (noised-prev training);
+        with 50 % probability it is the clean FFT-degraded y_target
+        (unnoised-prev training, corresponding to BD3LM's unmasked conditioning).
         """
-        B = y.shape[0]
+        B, _, C = y.shape
         device = y.device
 
-        t = torch.randint(0, self.num_diffusion_steps, (B,), device=device)
         cond = self.condition_encoder(context)
 
-        # FFT degradation targets
-        y_target, y_k = self._compute_xt(y, t)
-
-        # Add Gaussian noise on top
-        noise = torch.randn_like(y_target)
-        y_t = self.q_sample(y_target, t, noise)
-
-        # Self-conditioning: with probability sc_rate, do a preliminary pass
-        sc_signal = None
-        if self.use_sc and torch.rand(1).item() < self.sc_rate:
-            with torch.no_grad():
-                y0_first, delta_first = self.denoiser(y_t, t, cond, sc_signal=None)
-                sc_signal = self._prepare_sc_signal(
-                    (y0_first + delta_first).detach(), t, augment=self.training
-                )
-
-        # Predict (with or without self-conditioning)
-        y0_pred, delta_pred = self.denoiser(y_t, t, cond, sc_signal=sc_signal)
+        # ── Timestep sampling ───────────────────────
+        if self.causal:
+            num_blocks = self.max_prediction_length // self.block_size
+            t_per_block = torch.randint(
+                0, self.num_diffusion_steps, (B, num_blocks), device=device)
+            t = t_per_block.repeat_interleave(self.block_size, dim=1)  # [B, pred_len]
+            
+            y_flat = y.reshape(B * num_blocks, self.block_size, C)
+            t_flat = t_per_block.reshape(B * num_blocks)
+            y_target_flat, y_k_flat = self._compute_xt(y_flat, t_flat)
+            
+            y_target = y_target_flat.reshape(B, self.max_prediction_length, C)
+            y_k      = y_k_flat.reshape(B, self.max_prediction_length, C)
+        else:
+            t_scalar = torch.randint(
+                0, self.num_diffusion_steps, (B,), device=device)
+            y_target, y_k = self._compute_xt(y, t_scalar)
+            t = t_scalar.unsqueeze(1).expand(B, self.max_prediction_length)
         delta_target = y_k - y_target
 
+        # ── Add Gaussian noise ────────────────────────────────────────────
+        y_t = self.q_sample(y_target, t)
+        if self.causal:
+            L = self.max_prediction_length
+            use_kv = (random.random() < self.block_noised_prev_prob)
+
+            if self.block_kv_mode == "noised_prev":
+                # 50% noised_prev (y_t as kv), 50% unnoised (clean y as kv)
+                y_kv = y_t if use_kv else y
+                t_kv = (t + self.num_diffusion_steps if use_kv
+                        else torch.full_like(t, 2 * self.num_diffusion_steps))
+
+            else:  # predicted_clean_prev
+                # 50% predicted_clean_prev, 50% unnoised
+                if use_kv:
+                    # Pass 1: run denoiser with clean conditioning (no grad) → predicted clean
+                    with torch.no_grad():
+                        y0_sg, _ = self.denoiser(
+                            torch.cat([y_t, y], dim=1),
+                            torch.cat([t, t], dim=1),
+                            cond,
+                        )
+                    # Pass 2 uses stop-grad predicted clean as kv
+                    y_kv = y0_sg[:, :L]   # [B, L, C]
+                    t_kv = t + self.num_diffusion_steps   # "predicted at noise level t"
+                else:
+                    y_kv = y
+                    t_kv = torch.full_like(t, 2 * self.num_diffusion_steps)
+
+            y_input = torch.cat([y_t, y_kv], dim=1)   # [B, 2L, C]
+            t_input = torch.cat([t, t_kv], dim=1)      # [B, 2L]
+        else:
+            y_input = y_t
+            t_input = t
+
+        # ── Main denoiser forward ─────────────────────────────────────────
+        y0_pred, delta_pred = self.denoiser(y_input, t_input, cond)
+        if self.causal:
+            y0_pred = y0_pred[:, :self.max_prediction_length, :]
+            delta_pred = delta_pred[:, :self.max_prediction_length, :]
+        
         # Losses
         stage_loss = F.mse_loss(y0_pred, y_target, reduction="none")
         fft1 = torch.fft.fft(y0_pred.transpose(1, 2), norm='forward')
@@ -479,30 +534,77 @@ class FFTDiffusion(nn.Module):
     def sample(
         self,
         context: Tensor,
+        eval_prediction_length: Optional[int] = None,
         num_samples: int = 1,
         stop_step: Optional[int] = None,
         return_scores: bool = False,
+        sampling_stride: int = 1,
+        use_early_stop: bool = False,
+        early_stop_safety_margin: int = 0,
     ):
         """
-        Generate forecasts via DDIM sampling.
+        Generate forecasts.
+
+        In **full** mode: original single-block DDIM sampling (unchanged).
+        In **block** mode: semi-AR block sampling (BD3LM-style).
+          - The full prediction sequence is initialised as pure Gaussian noise.
+          - Blocks are denoised left-to-right.
+          - Each block runs ``num_sampling_steps`` reverse diffusion steps.
+          - Previously generated (clean) blocks remain frozen and serve as
+            causal conditioning for the current block via the block-causal
+            self-attention.
 
         Args:
-            context: [B, ctx_len, C]
-            num_samples: ensemble size
-            stop_step: if set, stop early at this diffusion timestep
-            return_scores: if True, return (pred, scores, steps) for pilot calibration
+            context:                [B, ctx_len, C]
+            eval_prediction_length: forecast horizon to generate; must be
+                                    ≤ max_prediction_length (training length).
+                                    In block mode must be divisible by block_size.
+                                    Defaults to the training prediction_length.
+            num_samples:            ensemble size
+            stop_step:              if set, stop full-mode sampling at this t
+            return_scores:          if True, return (pred, scores, steps)
+            sampling_stride:        staggered block sampler stride (1 = sequential)
+            use_early_stop:         block mode only — each block independently
+                                    detects its own optimal stop step inline;
+                                    requires num_samples > 1.
+            early_stop_safety_margin: steps before detected breakpoint to stop.
         Returns:
-            predictions [B, pred_len, C]  (or tuple when return_scores=True)
+            predictions [B, eval_len, C]  (or tuple when return_scores=True)
         """
         B_orig, _, C = context.shape
         device = context.device
+
+        eval_len = eval_prediction_length if eval_prediction_length is not None \
+            else self.max_prediction_length
+        assert eval_len <= self.max_prediction_length, (
+            f"eval_prediction_length ({eval_len}) exceeds "
+            f"max_prediction_length ({self.max_prediction_length})")
 
         cond = self.condition_encoder(context)
         if num_samples > 1:
             cond = repeat(cond, "b c p d -> (b n) c p d", n=num_samples)
 
         B_eff = B_orig * num_samples
-        y_t = torch.randn(B_eff, self.prediction_length, C, device=device)
+
+        if not self.causal:
+            return self._sample_full(
+                cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores)
+
+        if sampling_stride > 1:
+            return self._sample_block_staggered(
+                cond, B_eff, C, device, eval_len, num_samples, sampling_stride)
+
+        return self._sample_block_semi_ar(
+            cond, B_eff, C, device, eval_len, num_samples,
+            stop_step=stop_step,
+            return_scores=return_scores,
+            use_early_stop=use_early_stop,
+            early_stop_safety_margin=early_stop_safety_margin,
+        )
+
+    def _sample_full(self, cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores):
+        """Full-sequence DDIM sampling; eval_len may be < max_prediction_length."""
+        y_t = torch.randn(B_eff, eval_len, C, device=device)
 
         times = select_sampling_timesteps(self.stage_boundaries, self.num_diffusion_steps, self.num_sampling_steps)
         pairs = list(zip(times[:-1], times[1:]))
@@ -510,27 +612,18 @@ class FFTDiffusion(nn.Module):
         all_scores: list = []
         all_steps: list = []
 
-        # Self-conditioning signal (accumulated across steps)
-        sc_signal = None
-
         for t_now, t_next in pairs:
             t_b = torch.full((B_eff,), t_now, device=device, dtype=torch.long)
             t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
 
-            y0_pred, delta_pred = self.denoiser(y_t, t_b, cond, sc_signal=sc_signal)
+            t_input = t_b.unsqueeze(1).expand(B_eff, eval_len)
+            y0_pred, delta_pred = self.denoiser(y_t, t_input, cond)
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
             candidate = y0_pred + delta_pred
 
-            # Update self-conditioning signal for next step
-            if self.use_sc:
-                sc_signal = self._prepare_sc_signal(candidate, t_b, augment=False)
-
-            # Collect scores for pilot calibration
             if return_scores:
-                if num_samples > 1:
-                    c_avg = rearrange(candidate, "(b n) l c -> b n l c", n=num_samples).mean(1)
-                else:
-                    c_avg = candidate
+                c_avg = (rearrange(candidate, "(b n) l c -> b n l c", n=num_samples).mean(1)
+                         if num_samples > 1 else candidate)
                 all_scores.append(c_avg.mean(dim=(-2, -1)))
                 all_steps.append(t_now)
 
@@ -561,9 +654,306 @@ class FFTDiffusion(nn.Module):
 
         if return_scores:
             scores = torch.stack(all_scores, dim=1)
-            steps_t = torch.tensor(all_steps, device=device, dtype=torch.float)
+            steps_t = torch.tensor(all_steps, device=y_t.device, dtype=torch.float)
             return y_t, scores, steps_t
         return y_t
+
+    @torch.no_grad()
+    def _sample_block_semi_ar(
+        self, cond, B_eff, C, device, eval_len, num_samples,
+        return_scores: bool = False,
+        use_early_stop: bool = False,
+        early_stop_safety_margin: int = 0,
+    ):
+        """
+        Semi-AR block sampling — faithful BD3LM-style.
+
+        Mirrors BD3LMS ``_semi_ar_sampler`` (no KV-cache path):
+          - Maintain a growing buffer ``y_gen`` of shape [B, eval_len, C].
+          - For each block b (left-to-right):
+              * Pass the accumulated window ``y_gen[:, 0:b_end]`` as a
+                SINGLE sequence to the denoiser (not doubled).
+              * The denoiser uses the block-causal mask (M_BC quadrant of
+                the full training mask), which allows block b to attend
+                to all previously generated clean blocks 0..b-1.
+              * t-encoding marks past blocks as clean (t = 2T) and the
+                current block as actively noisy (t = t_now).
+              * Run ``num_sampling_steps`` DDIM reverse steps on block b.
+              * Write the denoised block b back into ``y_gen``.
+
+        Args:
+            return_scores: collect per-step ensemble-mean scores averaged
+                           across blocks and return them.  Used by
+                           find_optimal_stop_step for full-mode calibration.
+            use_early_stop: per-block inline early stopping — each block
+                            independently runs all S steps, detects its own
+                            breakpoint via find_global_early_stop, and
+                            commits the candidate at that step.
+                            Requires num_samples > 1.
+            early_stop_safety_margin: safety_margin passed to
+                            find_global_early_stop for each block.
+
+        eval_len must be divisible by block_size (asserted in sample()).
+        """
+        num_blocks = math.ceil(eval_len / self.block_size)
+        padded_eval_len = num_blocks * self.block_size
+
+        # Initialise the full buffer as Gaussian noise
+        y_gen = torch.randn(B_eff, padded_eval_len, C, device=device)
+
+        times = select_sampling_timesteps(
+            self.stage_boundaries, self.num_diffusion_steps, self.num_sampling_steps)
+        pairs = list(zip(times[:-1], times[1:]))
+
+        all_block_scores: list = []  # for return_scores: [num_blocks] × Tensor[B, S]
+        steps_recorded: list = []    # for return_scores: populated from first block
+
+        for b_idx in range(num_blocks):
+            b_start = b_idx * self.block_size
+            b_end   = (b_idx + 1) * self.block_size
+
+            block_score_list: list = []  # for return_scores: [S] × Tensor[B]
+            cand_buf: list = []           # for inline ES: [S] × Tensor[B_eff, bs, C]
+            es_score_list: list = []      # for inline ES: [S] × Tensor[B]
+            es_steps_list: list = []      # for inline ES: [S] float timesteps
+
+            for t_now, t_next in pairs:
+                t_b  = torch.full((B_eff,), t_now,  device=device, dtype=torch.long)
+                t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
+
+                # ── BD3LMS-style single growing window ───────────────────────
+                # Pass y_gen[:, 0:b_end] — only the accumulated (clean) prefix
+                # + current noisy block.  The denoiser applies a block-causal
+                # mask (M_BC) so that block b can attend to blocks 0..b-1.
+                y_input = y_gen[:, :b_end]   # [B_eff, b_end, C]
+
+                # t-encoding: clean past blocks → 2T, current block → t_now.
+                # (Same convention as training: 2T = "already clean" sentinel.)
+                t_input = torch.full((B_eff, b_end), 2 * self.num_diffusion_steps,
+                                     device=device, dtype=torch.long)
+                t_input[:, b_start:b_end] = t_now
+
+                y0_pred, delta_pred = self.denoiser(
+                    y_input, t_input, cond, sample_mode=True)
+                # y0_pred / delta_pred: [B_eff, b_end, C] — use last block only
+                candidate_b = y0_pred[:, b_start:b_end] + delta_pred[:, b_start:b_end]
+
+                # ── Score collection (shared for return_scores and inline ES) ─
+                if return_scores or use_early_stop:
+                    c_avg = (
+                        rearrange(candidate_b, "(b n) l c -> b n l c", n=num_samples).mean(1)
+                        if num_samples > 1 else candidate_b
+                    )  # [B, bs, C]
+                    score = c_avg.mean(dim=(-2, -1))  # [B]
+                    if return_scores:
+                        block_score_list.append(score)
+                        if b_idx == 0:
+                            steps_recorded.append(t_now)
+                    if use_early_stop:
+                        cand_buf.append(candidate_b.detach().clone())
+                        es_score_list.append(score)
+                        es_steps_list.append(float(t_now))
+
+                if t_next < 0:
+                    y_gen[:, b_start:b_end] = candidate_b
+                    break
+
+                # ── DDIM update (current block only) ─────────────────────────
+                noise_pred_b = self._noise_from_y0(
+                    y_gen[:, b_start:b_end], t_b, y0_pred[:, b_start:b_end])
+
+                _, tau_k, _, _ = self._stage_info(t_b)
+                denom = (t_b.float() - tau_k.float())
+                safe  = denom.abs() > 0.5
+                scale = torch.where(
+                    safe, (t_b - t_nb).float() / denom,
+                    torch.zeros_like(denom)).view(-1, 1, 1)
+                y0_corr = y0_pred[:, b_start:b_end] + delta_pred[:, b_start:b_end] * scale
+                alpha_t = extract(self.alphas_cumprod, t_b,  y_gen[:, b_start:b_end].shape)
+                alpha_s = extract(self.alphas_cumprod, t_nb, y_gen[:, b_start:b_end].shape)
+                sigma   = self.eta * (
+                    (1 - alpha_t / alpha_s) * (1 - alpha_s) / (1 - alpha_t)).sqrt()
+                c_coef  = (1 - alpha_s - sigma ** 2).sqrt()
+                y_gen[:, b_start:b_end] = (
+                    y0_corr * alpha_s.sqrt()
+                    + c_coef * noise_pred_b
+                    + sigma * torch.randn_like(y0_corr)
+                )
+            # block b_idx is now fully denoised; it stays frozen in y_gen
+            # and will serve as causal context for subsequent blocks.
+
+            # ── Per-block inline early stopping ───────────────────────────────
+            # Each block independently detects its own breakpoint from the
+            # full S-step score trajectory collected above, then overwrites
+            # y_gen with the candidate at that block-specific step.
+            if use_early_stop:
+                if len(cand_buf) > 1:
+                    scores_b  = torch.stack(es_score_list, dim=1)   # [B, S]
+                    steps_loc = torch.tensor(es_steps_list, dtype=torch.float,
+                                             device=device)          # descending
+                    es = find_global_early_stop(
+                        scores_b, steps=steps_loc,
+                        safety_margin=early_stop_safety_margin,
+                    )
+                    stop_s = len(cand_buf) - 1   # fallback: last step
+                    for k, t_k in enumerate(es_steps_list):
+                        if t_k <= es["stop_step"]:
+                            stop_s = k
+                            break
+                    y_gen[:, b_start:b_end] = cand_buf[stop_s]
+                elif cand_buf:  # only 1 step collected (degenerate)
+                    y_gen[:, b_start:b_end] = cand_buf[0]
+
+            if return_scores and block_score_list:
+                all_block_scores.append(torch.stack(block_score_list, dim=1))  # [B, S]
+
+        y_gen = y_gen[:, :eval_len, :]
+        if num_samples > 1:
+            y_gen = rearrange(y_gen, "(b n) l c -> b n l c", n=num_samples).mean(1)
+
+        if return_scores and all_block_scores:
+            # Average per-block score trajectories → single [B, S] tensor
+            scores = torch.stack(all_block_scores, dim=0).mean(0)
+            steps_t = torch.tensor(steps_recorded, dtype=torch.float, device=y_gen.device)
+            return y_gen, scores, steps_t
+        return y_gen
+
+    @torch.no_grad()
+    def _sample_block_staggered(
+        self, cond, B_eff, C, device, eval_len, num_samples, sampling_stride
+    ):
+        """
+        Pipelined / staggered block sampling.
+
+        Consecutive blocks start ``sampling_stride`` global steps apart so
+        that multiple blocks are denoised concurrently.  A single denoiser
+        call per global step covers the entire active window.
+
+        Schedule (S = num_sampling_steps per block):
+          block b starts at global step  g = b * sampling_stride
+          block b finishes at            g = b * sampling_stride + S - 1
+          total global steps             = S + (num_blocks - 1) * sampling_stride
+
+        When ``block_kv_mode == "noised_prev"``:
+          Single-sequence format with ``sample_mode=True`` (same as
+          _sample_block_semi_ar).  Each block's positions carry its own
+          t_now; done-block positions are marked with t = 2T.
+
+        When ``block_kv_mode == "predicted_clean_prev"``:
+          Doubled ``[y_t | y_kv]`` format.
+          ``y_kv[b]`` = latest ``y0_pred + delta_pred`` of block b from the
+          previous global step.  ``t_kv[b] = t_now_b + T`` for active blocks,
+          ``2T`` for done blocks.  On the first global step of each block,
+          ``y_kv[b]`` is initialised to the same Gaussian noise as ``y_gen[b]``.
+        """
+        num_blocks = math.ceil(eval_len / self.block_size)
+        padded_eval_len = num_blocks * self.block_size
+        bs = self.block_size
+
+        y_gen = torch.randn(B_eff, padded_eval_len, C, device=device)
+
+        times = select_sampling_timesteps(
+            self.stage_boundaries, self.num_diffusion_steps, self.num_sampling_steps)
+        S = len(times) - 1   # denoising steps per block
+
+        # kv buffer only needed for predicted_clean_prev
+        if self.block_kv_mode == "predicted_clean_prev":
+            y_kv_buf = y_gen.clone()  # initial value = Gaussian noise
+
+        total_steps = S + (num_blocks - 1) * sampling_stride
+
+        for g in range(total_steps):
+            # The last block that has been started at this global step
+            last_started = min(g // sampling_stride, num_blocks - 1)
+            active_end = (last_started + 1) * bs
+
+            # Build per-position timestep tensor for the y_t half
+            # Done-block positions keep t = 2T; active-block positions get their t_now
+            t_yt = torch.full((B_eff, active_end), 2 * self.num_diffusion_steps,
+                              device=device, dtype=torch.long)
+            for b in range(last_started + 1):
+                local_step = g - b * sampling_stride
+                if 0 <= local_step < S:
+                    t_yt[:, b * bs:(b + 1) * bs] = times[local_step]
+
+            if self.block_kv_mode == "noised_prev":
+                # ── single-sequence, same format as _sample_block_semi_ar ───────
+                y0_pred, delta_pred = self.denoiser(
+                    y_gen[:, :active_end], t_yt, cond, sample_mode=True)
+
+            else:  # predicted_clean_prev
+                # ── doubled [y_t | y_kv] format ───────────────────────────────
+                # t_kv: active blocks → t_now + T  ("predicted at noise level t")
+                #        done blocks  → 2T          (fully clean)
+                t_kv = torch.full((B_eff, active_end), 2 * self.num_diffusion_steps,
+                                  device=device, dtype=torch.long)
+                for b in range(last_started + 1):
+                    local_step = g - b * sampling_stride
+                    if 0 <= local_step < S:
+                        t_kv[:, b * bs:(b + 1) * bs] = (
+                            times[local_step] + self.num_diffusion_steps)
+
+                y_input = torch.cat([y_gen[:, :active_end], y_kv_buf[:, :active_end]], dim=1)
+                t_input = torch.cat([t_yt, t_kv], dim=1)
+                y0_pred, delta_pred = self.denoiser(y_input, t_input, cond)
+                y0_pred   = y0_pred[:, :active_end]
+                delta_pred = delta_pred[:, :active_end]
+
+                # Update kv buffer for active blocks with the current prediction
+                # (used as y_kv in the NEXT global step)
+                for b in range(last_started + 1):
+                    local_step = g - b * sampling_stride
+                    if 0 <= local_step < S:
+                        y_kv_buf[:, b * bs:(b + 1) * bs] = (
+                            y0_pred[:, b * bs:(b + 1) * bs]
+                            + delta_pred[:, b * bs:(b + 1) * bs])
+
+            # ── DDIM update for every active block ────────────────────────────
+            for b in range(last_started + 1):
+                local_step = g - b * sampling_stride
+                if not (0 <= local_step < S):
+                    continue
+
+                t_now  = times[local_step]
+                t_next = times[local_step + 1]
+                t_b  = torch.full((B_eff,), t_now,  device=device, dtype=torch.long)
+                t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
+
+                b_s = b * bs
+                b_e = (b + 1) * bs
+                y0_b    = y0_pred[:, b_s:b_e]
+                delta_b = delta_pred[:, b_s:b_e]
+                candidate_b = y0_b + delta_b
+
+                if t_next < 0:
+                    # Block b is fully denoised — freeze it
+                    y_gen[:, b_s:b_e] = candidate_b
+                    if self.block_kv_mode == "predicted_clean_prev":
+                        y_kv_buf[:, b_s:b_e] = candidate_b
+                else:
+                    noise_pred_b = self._noise_from_y0(
+                        y_gen[:, b_s:b_e], t_b, y0_b)
+                    _, tau_k, _, _ = self._stage_info(t_b)
+                    denom = (t_b.float() - tau_k.float())
+                    safe  = denom.abs() > 0.5
+                    scale = torch.where(
+                        safe, (t_b - t_nb).float() / denom,
+                        torch.zeros_like(denom)).view(-1, 1, 1)
+                    y0_corr  = y0_b + delta_b * scale
+                    alpha_t  = extract(self.alphas_cumprod, t_b,  y_gen[:, b_s:b_e].shape)
+                    alpha_s  = extract(self.alphas_cumprod, t_nb, y_gen[:, b_s:b_e].shape)
+                    sigma    = self.eta * (
+                        (1 - alpha_t / alpha_s) * (1 - alpha_s) / (1 - alpha_t)).sqrt()
+                    c_coef   = (1 - alpha_s - sigma ** 2).sqrt()
+                    y_gen[:, b_s:b_e] = (
+                        y0_corr * alpha_s.sqrt()
+                        + c_coef * noise_pred_b
+                        + sigma * torch.randn_like(y0_corr))
+
+        y_gen = y_gen[:, :eval_len]
+        if num_samples > 1:
+            y_gen = rearrange(y_gen, "(b n) l c -> b n l c", n=num_samples).mean(1)
+        return y_gen
 
     @torch.no_grad()
     def find_optimal_stop_step(
@@ -578,16 +968,14 @@ class FFTDiffusion(nn.Module):
         Run pilot samples through full diffusion to find the optimal
         global stopping step via piecewise-linear breakpoint detection.
 
-        Args:
-            pilot_contexts: [N, ctx_len, C]
-            num_samples: ensemble size per pilot
-            smooth_window: moving-avg window (None = auto)
-            min_frac: min fraction of trajectory on each side
-            safety_margin: stop this many indices before breakpoint
-
-        Returns:
-            dict from find_global_early_stop
+        Note: in block-diffusion mode (block_size < prediction_length)
+        ``return_scores`` is not supported; the method falls back to full
+        sampling and returns an empty dict (early stopping disabled).
         """
+        if self.block_diffusion_mode != "full":
+            # Early stopping not yet supported for block mode
+            return {"stop_step": None}
+
         _, scores, steps = self.sample(
             pilot_contexts, num_samples=num_samples, return_scores=True,
         )
@@ -604,7 +992,7 @@ class FFTDiffusion(nn.Module):
     def from_config(cls, cfg) -> "FFTDiffusion":
         return cls(
             context_length=cfg.context_length,
-            prediction_length=cfg.prediction_length,
+            max_prediction_length=cfg.prediction_length,
             patch_size=cfg.patch_size,
             d_model_encoder=cfg.d_model_encoder,
             d_model_denoiser=cfg.d_model_denoiser,
@@ -622,10 +1010,10 @@ class FFTDiffusion(nn.Module):
             stage_schedule=cfg.stage_schedule,
             topk_schedule=cfg.topk_schedule,
             eta=cfg.eta,
-            channel_independent=cfg.channel_independent,
-            num_features=cfg.num_features,
             transform_type=cfg.transform_type,
             ma_kernel_size=cfg.ma_kernel_size,
-            sc_rate=cfg.sc_rate,
-            sc_aug_rate=cfg.sc_aug_rate,
+            block_diffusion_mode=getattr(cfg, "block_diffusion_mode", "full"),
+            block_size=getattr(cfg, "block_size", None),
+            block_noised_prev_prob=getattr(cfg, "block_noised_prev_prob", 0.5),
+            block_kv_mode=getattr(cfg, "block_kv_mode", "noised_prev"),
         )

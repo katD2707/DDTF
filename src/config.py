@@ -1,8 +1,8 @@
 """Configuration dataclasses with YAML serialization."""
 
-from dataclasses import dataclass, fields, asdict
+from dataclasses import dataclass, field, fields, asdict
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 
@@ -28,6 +28,47 @@ class DataConfig:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Perturbation  (SEER Appendix B, Algorithms 1–4)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PerturbationConfig:
+    """Controls synthetic data perturbation applied to the training split only.
+
+    Setting ``enabled: false`` (the default) leaves the training data unchanged.
+    When enabled, each listed type in ``types`` is applied sequentially to the
+    raw training array before scaling and windowing.
+
+    Valid type names: ``white_noise``, ``anomalies``, ``missing_values``,
+    ``distribution_shift``.
+    """
+
+    enabled: bool = False
+    types: List[str] = field(default_factory=list)
+
+    # Reproducibility
+    seed: Optional[int] = None
+
+    # ── Algorithm 1: White Noise (Appendix B.1) ──────────────────────────
+    noise_ratio: float = 0.05    # r_noise  – fraction of points to corrupt
+    noise_scale: float = 1.0     # α_noise  – noise std multiplier (× channel std)
+
+    # ── Algorithm 2: Anomalies (Appendix B.2) ────────────────────────────
+    cont_anomaly_ratio: float = 0.05   # r_cont  – fraction of time covered by segments
+    cont_segment_len: int = 12          # L_cont  – length of each anomaly segment
+    outlier_ratio: float = 0.005        # r_out   – fraction of point outliers (0.5%)
+    anomaly_scale: float = 2.0          # α_anom  – anomaly magnitude (× channel std)
+
+    # ── Algorithm 3: Missing Values (Appendix B.3) ───────────────────────
+    missing_ratio: float = 0.05        # r_miss  – fraction of time to zero-out
+    missing_segment_len: int = 12       # L_miss  – length of each missing segment
+
+    # ── Algorithm 4: Distribution Shift (Appendix B.4) ───────────────────
+    num_shift_segments: int = 5         # K_shift – number of segments
+    shift_scale: float = 5.0            # α_shift – shift magnitude (× channel std)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Model
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -35,8 +76,8 @@ class DataConfig:
 class ModelConfig:
     # Input/Output
     context_length: int = 96
-    prediction_length: int = 96
-    num_features: int = 1  # determined at runtime
+    prediction_length: int = 1056
+    num_features: int = 1  # determined at runtimes
 
     # RevIN
     use_revin: bool = True
@@ -54,9 +95,6 @@ class ModelConfig:
     d_model_denoiser: int = 128
     n_denoiser_layers: int = 2
     mlp_ratio: int = 4
-
-    # Channel mode
-    channel_independent: bool = True   # True = per-channel; False = project [patch_size*C]→d_embed
 
     # Common
     dropout: float = 0.1
@@ -76,9 +114,13 @@ class ModelConfig:
     transform_type: Literal["fft", "ma"] = "fft"
     ma_kernel_size: int = 3  # box-kernel width for MA transform
 
-    # Self-conditioning
-    sc_rate: float = 0.4       # probability of applying self-conditioning during training
-    sc_aug_rate: float = 0.65  # probability of augmenting the self-conditioning signal
+    # Block diffusion (BD3LM-style causal block training/inference)
+    # "full"  → block_size = prediction_length (original, no causal structure)
+    # "fixed" → user-specified block_size (must divide prediction_length and patch_size)
+    block_diffusion_mode: Literal["full", "fixed"] = "full"
+    block_size: Optional[int] = None       # required when block_diffusion_mode="fixed"
+    block_noised_prev_prob: float = 0.5    # P(KV source = noisy y_t) during training; 1-p → clean y_target
+    block_kv_mode: Literal["noised_prev", "predicted_clean_prev"] = "noised_prev"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -123,7 +165,8 @@ class TrainingConfig:
     early_stop_safety_margin: int = 0
 
     # Sampling
-    num_samples: int = 1  # ensemble size for evaluation
+    num_samples: int = 1              # ensemble size for evaluation
+    sampling_stride: int = 1          # staggered block sampler stride; 1 = sequential (default)
 
     # Logging
     log_interval: int = 50
@@ -143,11 +186,13 @@ class Config:
     data: DataConfig = None          # type: ignore[assignment]
     model: ModelConfig = None        # type: ignore[assignment]
     training: TrainingConfig = None  # type: ignore[assignment]
+    perturbation: PerturbationConfig = None  # type: ignore[assignment]
 
     def __post_init__(self):
         self.data = self.data or DataConfig()
         self.model = self.model or ModelConfig()
         self.training = self.training or TrainingConfig()
+        self.perturbation = self.perturbation or PerturbationConfig()
 
     # ── I/O ───────────────────────────────────────────────────────────────
 
@@ -156,6 +201,7 @@ class Config:
             "data": asdict(self.data),
             "model": asdict(self.model),
             "training": asdict(self.training),
+            "perturbation": asdict(self.perturbation),
         }
 
     def save_yaml(self, path: str):
@@ -177,22 +223,24 @@ class Config:
           1. Nested:   {data: {csv: ...}, model: {context_length: ...}, training: {batch_size: ...}}
           2. Flat:     {csv: ..., context_length: ..., batch_size: ...}
         """
-        if any(k in raw for k in ("data", "model", "training")):
+        if any(k in raw for k in ("data", "model", "training", "perturbation")):
             data_cfg = _from_dict(DataConfig, raw.get("data", {}))
             model_cfg = _from_dict(ModelConfig, raw.get("model", {}))
             train_cfg = _from_dict(TrainingConfig, raw.get("training", {}))
+            perturb_cfg = _from_dict(PerturbationConfig, raw.get("perturbation", {}))
         else:
             data_cfg = _from_dict(DataConfig, raw)
             model_cfg = _from_dict(ModelConfig, raw)
             train_cfg = _from_dict(TrainingConfig, raw)
-        return cls(data=data_cfg, model=model_cfg, training=train_cfg)
+            perturb_cfg = PerturbationConfig()
+        return cls(data=data_cfg, model=model_cfg, training=train_cfg, perturbation=perturb_cfg)
 
     def override(self, overrides: Dict[str, Any]):
         """Apply flat key-value overrides (from CLI args) to matching fields."""
         for key, val in overrides.items():
             if val is None:
                 continue
-            for sub_cfg in (self.data, self.model, self.training):
+            for sub_cfg in (self.data, self.model, self.training, self.perturbation):
                 if hasattr(sub_cfg, key):
                     setattr(sub_cfg, key, val)
                     break
