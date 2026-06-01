@@ -805,6 +805,14 @@ class FFTDiffusion(nn.Module):
                 elif cand_buf:  # only 1 step collected (degenerate)
                     y_gen[:, b_start:b_end] = cand_buf[0]
 
+            # Synchronize the committed block across replicas so that block b+1
+            # sees a clean, averaged causal context instead of diverse per-replica noise.
+            if num_samples > 1:
+                avg_b = rearrange(
+                    y_gen[:, b_start:b_end], "(b n) l c -> b n l c", n=num_samples
+                ).mean(1)
+                y_gen[:, b_start:b_end] = avg_b.repeat_interleave(num_samples, dim=0)
+
             if return_scores and block_score_list:
                 all_block_scores.append(torch.stack(block_score_list, dim=1))  # [B, S]
 

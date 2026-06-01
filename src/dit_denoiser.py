@@ -323,7 +323,16 @@ class DiTDenoiser(nn.Module):
         B, L, C = input.shape
 
         t_rep = repeat(t, "b l -> (b c) l", c=C)
-        h = self.patch_embedding(input)  # [B*C, P_in, D]
+        if not sample_mode and self.use_causal_block_attn:
+            assert L % 2 == 0, "Input length must be even in block diffusion training mode"
+            h_past = self.patch_embedding(input[:, :L//2])
+            # Current noisy block → y_t position (b_start_patch .. b_end_patch-1)
+            h_curr = self.patch_embedding(input[:, L//2:])
+            # Layout [h_past | h_curr] keeps output indices aligned with input:
+            # output[:, b_start:b_end] still yields the current block.
+            h = torch.cat([h_past, h_curr], dim=1)
+        else:
+            h = self.patch_embedding(input)  # [B*C, P_in, D]
         cond_emb = self.context_proj(rearrange(cond, "b c p d -> (b c) p d"))
         c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
 
