@@ -319,8 +319,8 @@ class FFTDiffusion(nn.Module):
         if block_diffusion_mode == "fixed":
             assert max_prediction_length % self._fixed_block_size == 0, (
                 f"max_prediction_length ({max_prediction_length}) must be divisible by block_size ({self._fixed_block_size})")
-            assert self._fixed_block_size % patch_size == 0, (
-                f"block_size ({self._fixed_block_size}) must be divisible by patch_size ({patch_size})")
+            # assert self._fixed_block_size % patch_size == 0, (
+            #     f"block_size ({self._fixed_block_size}) must be divisible by patch_size ({patch_size})")
         self.block_size = self._get_block_size()
 
         # Sub-modules
@@ -503,6 +503,7 @@ class FFTDiffusion(nn.Module):
 
         # ── Main denoiser forward ─────────────────────────────────────────
         y0_pred, delta_pred = self.denoiser(y_input, t_input, cond)
+        rec_loss = F.mse_loss(y0_pred[:, self.max_prediction_length:, :], y, reduction="none")
         if self.causal:
             y0_pred = y0_pred[:, :self.max_prediction_length, :]
             delta_pred = delta_pred[:, :self.max_prediction_length, :]
@@ -520,8 +521,9 @@ class FFTDiffusion(nn.Module):
         # Filter outliers
         stage_loss = stage_loss[stage_loss < 100].mean()
         degrad_loss = degrad_loss[degrad_loss < 100].mean()
+        rec_loss = rec_loss[rec_loss < 100].mean()
 
-        total = stage_loss + degrad_loss
+        total = stage_loss + degrad_loss + rec_loss
         return {
             "total": total,
             "stage": stage_loss,
@@ -596,7 +598,6 @@ class FFTDiffusion(nn.Module):
 
         return self._sample_block_semi_ar(
             cond, B_eff, C, device, eval_len, num_samples,
-            stop_step=stop_step,
             return_scores=return_scores,
             use_early_stop=use_early_stop,
             early_stop_safety_margin=early_stop_safety_margin,

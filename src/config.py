@@ -167,6 +167,7 @@ class TrainingConfig:
     # Sampling
     num_samples: int = 1              # ensemble size for evaluation
     sampling_stride: int = 1          # staggered block sampler stride; 1 = sequential (default)
+    eval_prediction_length: int = 0
 
     # Logging
     log_interval: int = 50

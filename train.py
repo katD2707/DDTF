@@ -53,6 +53,7 @@ def evaluate(
     revin: Optional[RevIN] = None,
     num_samples: int = 1,
     stop_step: Optional[int] = None,
+    eval_length: Optional[int] = None,
     sampling_stride: int = 1,
     use_early_stop: bool = False,
     early_stop_safety_margin: int = 0,
@@ -71,7 +72,7 @@ def evaluate(
             ctx = revin(ctx, mode="norm")
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                             sampling_stride=sampling_stride,
+                             sampling_stride=sampling_stride, eval_prediction_length=eval_length,
                              use_early_stop=use_early_stop,
                              early_stop_safety_margin=early_stop_safety_margin)
 
@@ -203,6 +204,7 @@ def main():
         dcfg.csv,
         context_length=mcfg.context_length,
         prediction_length=mcfg.prediction_length,
+        eval_prediction_length=tcfg.eval_prediction_length,
         target_col=dcfg.target_col,
         perturbation_cfg=cfg.perturbation,
     )
@@ -367,6 +369,7 @@ def main():
             metrics = evaluate(model, val_loader, device, revin=revin,
                                num_samples=tcfg.num_samples, stop_step=stop_step,
                                sampling_stride=tcfg.sampling_stride,
+                               eval_length=tcfg.eval_prediction_length,
                                use_early_stop=tcfg.use_early_stop,
                                early_stop_safety_margin=tcfg.early_stop_safety_margin)
             print(f"  ↳ Val  MSE={metrics['mse']:.4f}  MAE={metrics['mae']:.4f}  RMSE={metrics['rmse']:.4f}")
@@ -445,6 +448,7 @@ def main():
     test_metrics = evaluate(model, test_loader, device, revin=revin,
                             num_samples=tcfg.num_samples, stop_step=stop_step,
                             sampling_stride=tcfg.sampling_stride,
+                            eval_length=tcfg.eval_prediction_length,
                             use_early_stop=tcfg.use_early_stop,
                             early_stop_safety_margin=tcfg.early_stop_safety_margin)
     print(f"\nTest  MSE={test_metrics['mse']:.4f}  MAE={test_metrics['mae']:.4f}  "

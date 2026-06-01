@@ -9,7 +9,7 @@ data:
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
-  context_length: 96
+  context_length: 192
   prediction_length: 192
   patch_size: 24
 
@@ -30,7 +30,7 @@ model:
   # Diffusion
   num_diffusion_steps: 1000
   num_sampling_steps: 20
-  num_fft_stages: 10
+  num_fft_stages: 3
   stage_schedule: linear    # linear | cosine | quadratic | sqrt
   topk_schedule: linear     # linear | cosine | quadratic | sqrt
   noise_schedule: linear    # linear | cosine | quad | sigmoid
@@ -45,9 +45,9 @@ model:
   # Block diffusion (BD3LM-style causal block training and semi-AR inference)
   #   full   → original; block_size = prediction_length (no causal structure added)
   #   fixed  → fixed block_size; must divide prediction_length and patch_size
-  block_diffusion_mode: full   # full | fixed
-  block_size: null             # int; required when block_diffusion_mode=fixed, default=patch_size
-  block_noised_prev_prob: 0.5  # 0.5 = 50% noised / 50% clean previous-block context
+  block_diffusion_mode: fixed   # full | fixed
+  block_size: 96             # int; required when block_diffusion_mode=fixed, default=patch_size
+  block_noised_prev_prob: 0.0  # 0.5 = 50% noised / 50% clean previous-block context
   block_kv_mode: noised_prev   # noised_prev | predicted_clean_prev
 
 
@@ -60,7 +60,7 @@ training:
   gradient_clip: 1.0
 
   lr_scheduler: cosine      # cosine | step | none
-  warmup_epochs: 5
+  warmup_epochs: 0
 
   use_ema: false
   ema_decay: 0.999
@@ -81,14 +81,15 @@ training:
   early_stop_safety_margin: 0
 
   # Sampling
-  num_samples: 50              # ensemble size for evaluation
+  num_samples: 30              # ensemble size for evaluation
   sampling_stride: 1           # staggered block sampler stride; 1 = sequential (default)
+  eval_prediction_length: 192
 
   # Logging & checkpointing
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal
+  checkpoint_dir: checkpoints/normal_2
   seed: 42
   device: auto              # auto | cpu | cuda
 

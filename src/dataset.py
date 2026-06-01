@@ -116,7 +116,8 @@ class TimeSeriesDataset(Dataset):
 def load_csv_dataset(
     csv_path: str,
     context_length: int = 96,
-    prediction_length: int = 96,
+    prediction_length: int = 1056,
+    eval_prediction_length: int = 96,
     stride: int = 1,
     target_col: Optional[str] = None,
     perturbation_cfg=None,
@@ -192,6 +193,6 @@ def load_csv_dataset(
         )
 
     train_ds = TimeSeriesDataset(train_data, context_length, prediction_length, stride)
-    val_ds   = TimeSeriesDataset(val_data,   context_length, prediction_length, stride, scaler=train_ds.scaler)
-    test_ds  = TimeSeriesDataset(test_data,  context_length, prediction_length, stride, scaler=train_ds.scaler)
+    val_ds   = TimeSeriesDataset(val_data,   context_length, eval_prediction_length, stride, scaler=train_ds.scaler)
+    test_ds  = TimeSeriesDataset(test_data,  context_length, eval_prediction_length, stride, scaler=train_ds.scaler)
     return train_ds, val_ds, test_ds

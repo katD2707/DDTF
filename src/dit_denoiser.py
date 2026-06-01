@@ -191,8 +191,8 @@ class DiTDenoiser(nn.Module):
         self.num_target_patches = self.patch_embedding.compute_num_patches(max_prediction_length)
 
         if use_causal_block_attn:
-            assert block_size is not None and block_size % patch_size == 0, (
-                "block_size must be provided and divisible by patch_size for block diffusion mode")
+            # assert block_size is not None and block_size % patch_size == 0, (
+            #     "block_size must be provided and divisible by patch_size for block diffusion mode")
             self.block_size = block_size
             # BD3LMS block_diff_mask: [2P, 2P] bool, True = attend
             self.register_buffer(
@@ -347,8 +347,8 @@ class DiTDenoiser(nn.Module):
         for block in self.blocks:
             h = block(h, c, cond_emb, attn_mask=attn_mask)
 
-        y0_out = self.final_layer(h, c).flatten(-2)[:, :L]
-        delta_out = self.delta_head(h, c).flatten(-2)[:, :L]
+        y0_out = self.final_layer(h, c).flatten(-2)
+        delta_out = self.delta_head(h, c).flatten(-2)
 
         y0_out = rearrange(y0_out, "(b c) l -> b l c", b=B, c=C)
         delta_out = rearrange(delta_out, "(b c) l -> b l c", b=B, c=C)
