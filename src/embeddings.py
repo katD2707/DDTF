@@ -61,14 +61,12 @@ class RotaryPositionalEmbedding(nn.Module):
 # ── Patch Embedding ──────────────────────────────────────────────────────────
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, patch_size: int = 24, d_model: int = 128,
-                 use_positional: bool = True):
+    def __init__(self, patch_size: int = 24, d_model: int = 128):
         super().__init__()
         self.patch_size = patch_size
         self.stride = patch_size
         self.projection = nn.Linear(patch_size, d_model, bias=False)
         self.padding_layer = nn.ReplicationPad1d((0, patch_size))
-        self.pos_emb = PositionalEmbedding(d_model) if use_positional else None
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -83,8 +81,6 @@ class PatchEmbedding(nn.Module):
             x = self.padding_layer(x.unsqueeze(1)).squeeze(1)
         x = x.unfold(-1, self.patch_size, self.stride)  # [B*C, N, P]
         x = self.projection(x)
-        if self.pos_emb is not None:
-            x = x + self.pos_emb(x)
         return x
 
     def compute_num_patches(self, seq_len: int) -> int:

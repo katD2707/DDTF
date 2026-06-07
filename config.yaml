@@ -47,9 +47,6 @@ model:
   #   fixed  → fixed block_size; must divide prediction_length and patch_size
   block_diffusion_mode: fixed   # full | fixed
   block_size: 96             # int; required when block_diffusion_mode=fixed, default=patch_size
-  block_noised_prev_prob: 0.0  # 0.5 = 50% noised / 50% clean previous-block context
-  block_kv_mode: noised_prev   # noised_prev | predicted_clean_prev
-
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
@@ -61,9 +58,6 @@ training:
 
   lr_scheduler: cosine      # cosine | step | none
   warmup_epochs: 0
-
-  use_ema: false
-  ema_decay: 0.999
 
   # AMP (automatic mixed precision)
   use_amp: false
@@ -82,7 +76,6 @@ training:
 
   # Sampling
   num_samples: 30              # ensemble size for evaluation
-  sampling_stride: 1           # staggered block sampler stride; 1 = sequential (default)
   eval_prediction_length: 192
 
   # Logging & checkpointing

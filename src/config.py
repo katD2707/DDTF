@@ -119,9 +119,6 @@ class ModelConfig:
     # "fixed" → user-specified block_size (must divide prediction_length and patch_size)
     block_diffusion_mode: Literal["full", "fixed"] = "full"
     block_size: Optional[int] = None       # required when block_diffusion_mode="fixed"
-    block_noised_prev_prob: float = 0.5    # P(KV source = noisy y_t) during training; 1-p → clean y_target
-    block_kv_mode: Literal["noised_prev", "predicted_clean_prev"] = "noised_prev"
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Training
@@ -140,10 +137,6 @@ class TrainingConfig:
     lr_step_size: int = 10
     lr_decay_factor: float = 0.5
     warmup_epochs: int = 5
-
-    # EMA
-    use_ema: bool = True
-    ema_decay: float = 0.99
 
     # AMP (automatic mixed precision)
     use_amp: bool = False
@@ -166,7 +159,6 @@ class TrainingConfig:
 
     # Sampling
     num_samples: int = 1              # ensemble size for evaluation
-    sampling_stride: int = 1          # staggered block sampler stride; 1 = sequential (default)
     eval_prediction_length: int = 0
 
     # Logging

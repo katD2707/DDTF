@@ -86,7 +86,6 @@ python train.py --csv data/ETTh1.csv --use_early_stop --num_pilot_samples 64
 | `--gradient_clip` | `1.0` | Gradient clipping norm |
 | `--lr_scheduler` | `cosine` | LR schedule: `cosine`, `step`, `none` |
 | `--warmup_epochs` | `5` | Linear warmup epochs |
-| `--ema_decay` | `0.99` | EMA model decay rate |
 | `--num_workers` | `2` | DataLoader workers |
 | `--eval_interval` | `5` | Validation every N epochs |
 | `--save_interval` | `10` | Checkpoint every N epochs |

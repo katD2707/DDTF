@@ -70,7 +70,6 @@ class TimeSeriesDataset(Dataset):
         data: np.ndarray,
         context_length: int = 96,
         prediction_length: int = 96,
-        stride: int = 1,
         scale: bool = True,
         scaler: Optional[StandardScaler] = None,
     ):
@@ -80,7 +79,6 @@ class TimeSeriesDataset(Dataset):
 
         self.context_length = context_length
         self.prediction_length = prediction_length
-        self.stride = stride
         self.num_channels = data.shape[1]
 
         if scale:
@@ -95,13 +93,13 @@ class TimeSeriesDataset(Dataset):
             self.data = data.astype(np.float32)
 
         total = context_length + prediction_length
-        self.num_samples = max(0, (len(self.data) - total) // stride + 1)
+        self.num_samples = max(0, len(self.data) - total + 1)
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        start = idx * self.stride
+        start = idx
         ctx_end = start + self.context_length
         tgt_end = ctx_end + self.prediction_length
         context = torch.from_numpy(self.data[start:ctx_end])
@@ -118,7 +116,6 @@ def load_csv_dataset(
     context_length: int = 96,
     prediction_length: int = 1056,
     eval_prediction_length: int = 96,
-    stride: int = 1,
     target_col: Optional[str] = None,
     perturbation_cfg=None,
 ):
@@ -135,7 +132,6 @@ def load_csv_dataset(
             dropped automatically.
         context_length: Historical context window length.
         prediction_length: Forecast horizon length.
-        stride: Step between consecutive sliding windows.
         target_col: If given, only this column is kept (univariate).
         perturbation_cfg: Optional ``PerturbationConfig`` instance.  When
             ``perturbation_cfg.enabled`` is ``True``, the specified
@@ -192,7 +188,7 @@ def load_csv_dataset(
             seed=perturbation_cfg.seed,
         )
 
-    train_ds = TimeSeriesDataset(train_data, context_length, prediction_length, stride)
-    val_ds   = TimeSeriesDataset(val_data,   context_length, eval_prediction_length, stride, scaler=train_ds.scaler)
-    test_ds  = TimeSeriesDataset(test_data,  context_length, eval_prediction_length, stride, scaler=train_ds.scaler)
+    train_ds = TimeSeriesDataset(train_data, context_length, prediction_length)
+    val_ds   = TimeSeriesDataset(val_data,   context_length, eval_prediction_length, scaler=train_ds.scaler)
+    test_ds  = TimeSeriesDataset(test_data,  context_length, eval_prediction_length, scaler=train_ds.scaler)
     return train_ds, val_ds, test_ds

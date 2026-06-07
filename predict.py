@@ -42,8 +42,6 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--num_sampling_steps", type=int, default=None,
                         help="Override sampling steps (fewer = faster)")
-    parser.add_argument("--sampling_stride", type=int, default=1,
-                        help="Staggered block sampler stride; 1 = sequential (default)")
 
     # Early stopping during sampling
     parser.add_argument("--use_auto_stop", action="store_true", default=False)
@@ -93,7 +91,6 @@ def run_evaluation(
     revin: Optional[RevIN] = None,
     num_samples: int = 1,
     stop_step: Optional[int] = None,
-    sampling_stride: int = 1,
     use_early_stop: bool = False,
     early_stop_safety_margin: int = 0,
 ):
@@ -108,7 +105,6 @@ def run_evaluation(
             ctx = revin(ctx, mode="norm")
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                             sampling_stride=sampling_stride,
                              use_early_stop=use_early_stop,
                              early_stop_safety_margin=early_stop_safety_margin)
 
@@ -183,7 +179,6 @@ def main():
     metrics, preds, targets = run_evaluation(
         model, test_loader, device, revin=revin,
         num_samples=args.num_samples, stop_step=stop_step,
-        sampling_stride=args.sampling_stride,
         use_early_stop=args.use_auto_stop,
         early_stop_safety_margin=args.auto_stop_safety_margin,
     )

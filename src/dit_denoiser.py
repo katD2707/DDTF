@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange, repeat
 
-from src.embeddings import PatchEmbedding, TimestepEmbedding
+from src.embeddings import PatchEmbedding, TimestepEmbedding, RotaryPositionalEmbedding, PositionalEmbedding
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -187,7 +187,8 @@ class DiTDenoiser(nn.Module):
         self.timestep_emb = TimestepEmbedding(d_model, patching=True, patch_size=patch_size)
         self.context_proj = nn.Linear(d_model_condition, d_model) if d_model_condition != d_model else nn.Identity()
 
-        self.patch_embedding = PatchEmbedding(patch_size, d_model, use_positional=True)
+        self.patch_embedding = PatchEmbedding(patch_size, d_model)
+        self.positional_embedding = PositionalEmbedding(d_model)
         self.num_target_patches = self.patch_embedding.compute_num_patches(max_prediction_length)
 
         if use_causal_block_attn:
@@ -255,21 +256,6 @@ class DiTDenoiser(nn.Module):
 
         return m_bd | m_obc | m_bc   # True = can attend
 
-    @staticmethod
-    def _build_block_causal_mask(num_patches: int, ppb: int) -> Tensor:
-        """
-        Block-causal attention mask for sample mode.
-
-        Mirrors BD3LMS `sample_mode=True`: the model sees only the
-        accumulated single sequence 0..b_end.  Token i may attend to
-        token j iff block(i) >= block(j)  (lower-triangular at block
-        granularity).  This is the lower-right ``M_BC`` quadrant of the
-        full training mask.  [num_patches, num_patches] bool.
-        """
-        q_idx = torch.arange(num_patches).unsqueeze(1)  # [P, 1]
-        k_idx = torch.arange(num_patches).unsqueeze(0)  # [1, P]
-        return (q_idx // ppb) >= (k_idx // ppb)
-
     # ── Weight initialisation ─────────────────────────────────────────────
 
     def _init_weights(self):
@@ -307,52 +293,49 @@ class DiTDenoiser(nn.Module):
         """
         Args:
             input:       [B, L, C]  where
-                           training / full mode  → L = max_prediction_length
-                           block training        → L = 2 * max_prediction_length
-                                                    (cat of y_t | y_kv halves)
-                           sample_mode           → L = b_end  (growing window)
+                           block training  → L = 2 * max_prediction_length
+                                              (cat of y_t | y_kv halves)
+                           sample_mode     → L = b_end  (growing window)
             t:           [B, L]  per-position timesteps; encoding mirrors L
             cond:        [B, C, P_ctx, D_cond]  encoder output
-            sample_mode: if True, use BD3LMS single-window block-causal mask
-                         instead of the doubled training mask.
+            sample_mode: if True, use growing-window inference.
+                         Both training halves are patchified separately from
+                         position 0, so past clean blocks in the growing window
+                         naturally share the same positional indices as y_kv
+                         blocks in training.
         Returns:
             (y0_pred, delta_pred) each [B, L_out, C]
-              training/full: L_out = max_prediction_length (y_t half only)
-              sample_mode:   L_out = b_end (full window; caller slices [b_start:b_end])
+              training: L_out = 2 * max_prediction_length
+              sample_mode: L_out = b_end (caller slices [b_start:b_end])
         """
         B, L, C = input.shape
 
         t_rep = repeat(t, "b l -> (b c) l", c=C)
-        if not sample_mode and self.use_causal_block_attn:
-            assert L % 2 == 0, "Input length must be even in block diffusion training mode"
-            h_past = self.patch_embedding(input[:, :L//2])
-            # Current noisy block → y_t position (b_start_patch .. b_end_patch-1)
-            h_curr = self.patch_embedding(input[:, L//2:])
-            # Layout [h_past | h_curr] keeps output indices aligned with input:
-            # output[:, b_start:b_end] still yields the current block.
-            h = torch.cat([h_past, h_curr], dim=1)
+        if self.use_causal_block_attn:
+            # Training: split [y_t | y_kv] and patchify each half from position 0.
+            # y_kv block b gets the same positional indices as block b in the
+            # growing-window inference, keeping train/inference consistent.
+            attn_mask = self.block_diff_mask
+            if sample_mode:
+                h = self.patch_embedding(input)
+                attn_mask = attn_mask[self.num_target_patches:self.num_target_patches+h.shape[1],
+                                      self.num_target_patches:self.num_target_patches+h.shape[1]]
+                h = h + self.positional_embedding(h)
+            else:
+                h_yt  = self.patch_embedding(input[:, :L // 2])
+                h_ykv = self.patch_embedding(input[:, L // 2:])
+                pos_emb = self.positional_embedding(h_yt)
+                h_yt = h_yt + pos_emb
+                h_ykv = h_ykv + pos_emb
+                h = torch.cat([h_yt, h_ykv], dim=1)
         else:
+            # Inference growing window: patchify [0..b_end] from position 0.
+            attn_mask = None
             h = self.patch_embedding(input)  # [B*C, P_in, D]
+            h = h + self.positional_embedding(h)
+
         cond_emb = self.context_proj(rearrange(cond, "b c p d -> (b c) p d"))
         c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
-
-        if self.use_causal_block_attn:
-            ppb = self.block_size // self.patch_size
-            if sample_mode:
-                # BD3LMS sample_mode: single growing window [0..b_end]
-                # → block-causal mask (lower-right M_BC quadrant of training mask)
-                P_in = h.shape[1]
-                attn_mask = self._build_block_causal_mask(P_in, ppb).to(h.device)
-            else:
-                # Training: doubled [y_t | y_kv] sequence → full BD3LMS mask
-                P_half = h.shape[1] // 2
-                if P_half != self.num_target_patches:
-                    attn_mask = self._build_block_diff_mask(P_half, ppb).to(h.device)
-                else:
-                    attn_mask = self.block_diff_mask
-        else:
-            attn_mask = None
-
         for block in self.blocks:
             h = block(h, c, cond_emb, attn_mask=attn_mask)
 

@@ -30,7 +30,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.config import Config
 from src.dataset import load_csv_dataset
 from src.diffusion import FFTDiffusion
-from src.ema import EMA
 from src.metrics import compute_metrics, MetricTracker
 from src.revin import RevIN
 
@@ -54,7 +53,6 @@ def evaluate(
     num_samples: int = 1,
     stop_step: Optional[int] = None,
     eval_length: Optional[int] = None,
-    sampling_stride: int = 1,
     use_early_stop: bool = False,
     early_stop_safety_margin: int = 0,
 ) -> dict:
@@ -72,12 +70,12 @@ def evaluate(
             ctx = revin(ctx, mode="norm")
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                             sampling_stride=sampling_stride, eval_prediction_length=eval_length,
+                             eval_prediction_length=eval_length,
                              use_early_stop=use_early_stop,
                              early_stop_safety_margin=early_stop_safety_margin)
 
-        if revin is not None:
-            pred = revin(pred, mode="denorm")
+        # if revin is not None:
+        #     pred = revin(pred, mode="denorm")
             # tgt is already in original scale (not normalized)
 
         all_preds.append(pred.cpu())
@@ -131,9 +129,6 @@ def parse_args():
     parser.add_argument("--block_diffusion_mode", type=str, default=None,
                         choices=["full", "fixed"])
     parser.add_argument("--block_size", type=int, default=None)
-    parser.add_argument("--block_noised_prev_prob", type=float, default=None)
-    parser.add_argument("--block_kv_mode", type=str, default=None,
-                        choices=["noised_prev", "predicted_clean_prev"])
 
     # Training overrides
     parser.add_argument("--learning_rate", type=float, default=None)
@@ -144,9 +139,6 @@ def parse_args():
     parser.add_argument("--lr_scheduler", type=str, default=None,
                         choices=["step", "cosine", "none"])
     parser.add_argument("--warmup_epochs", type=int, default=None)
-    parser.add_argument("--use_ema", action="store_true", default=None)
-    parser.add_argument("--no_ema", dest="use_ema", action="store_false")
-    parser.add_argument("--ema_decay", type=float, default=None)
     parser.add_argument("--use_amp", action="store_true", default=None)
     parser.add_argument("--no_amp", dest="use_amp", action="store_false")
     parser.add_argument("--patience", type=int, default=None)
@@ -155,8 +147,6 @@ def parse_args():
     parser.add_argument("--num_pilot_samples", type=int, default=None)
     parser.add_argument("--early_stop_safety_margin", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=None)
-    parser.add_argument("--sampling_stride", type=int, default=None,
-                        help="Staggered block sampler stride; 1 = sequential")
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--eval_interval", type=int, default=None)
     parser.add_argument("--save_interval", type=int, default=None)
@@ -232,12 +222,6 @@ def main():
         revin = RevIN(num_features=mcfg.num_features, affine=mcfg.revin_affine).to(device)
         print("RevIN enabled")
 
-    # ── EMA ───────────────────────────────────────────────────────────────
-    ema = None
-    if tcfg.use_ema:
-        ema = EMA(model, decay=tcfg.ema_decay)
-        print(f"EMA enabled (decay={tcfg.ema_decay})")
-
     # ── Optimizer & Scheduler ─────────────────────────────────────────────
     params = list(model.parameters())
     if revin is not None and mcfg.revin_affine:
@@ -281,8 +265,6 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer"])
             if scheduler is not None and "scheduler" in ckpt:
                 scheduler.load_state_dict(ckpt["scheduler"])
-            if ema is not None and "ema" in ckpt:
-                ema.load_state_dict(ckpt["ema"])
             if amp_enabled and "scaler" in ckpt:
                 scaler.load_state_dict(ckpt["scaler"])
             if revin is not None and "revin" in ckpt:
@@ -316,7 +298,7 @@ def main():
             # RevIN: normalize context and target for training
             if revin is not None:
                 ctx = revin(ctx, mode="norm")
-                tgt = revin(tgt, mode="norm", reuse_stats=True)
+                # tgt = revin(tgt, mode="norm", reuse_stats=True)
 
             optimizer.zero_grad()
 
@@ -324,17 +306,19 @@ def main():
                 loss_dict = model(tgt, ctx)
                 loss = loss_dict["total"]
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), tcfg.gradient_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), tcfg.gradient_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), tcfg.gradient_clip)
+                optimizer.step()
 
             if scheduler is not None and tcfg.lr_scheduler == "cosine":
                 scheduler.step()
-
-            if ema is not None:
-                ema.update()
 
             tracker.update({"loss": loss.item()})
             global_step += 1
@@ -349,10 +333,6 @@ def main():
 
         # ── Validation ────────────────────────────────────────────────────
         if epoch % tcfg.eval_interval == 0:
-            # Apply EMA weights for evaluation
-            if ema is not None:
-                ema.apply_shadow()
-
             stop_step = None
             if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
                 pilot_ctx, _ = next(iter(val_loader))
@@ -368,7 +348,6 @@ def main():
 
             metrics = evaluate(model, val_loader, device, revin=revin,
                                num_samples=tcfg.num_samples, stop_step=stop_step,
-                               sampling_stride=tcfg.sampling_stride,
                                eval_length=tcfg.eval_prediction_length,
                                use_early_stop=tcfg.use_early_stop,
                                early_stop_safety_margin=tcfg.early_stop_safety_margin)
@@ -392,10 +371,6 @@ def main():
             else:
                 patience_counter += 1
 
-            # Restore training weights
-            if ema is not None:
-                ema.restore()
-
             # Patience-based early stopping
             if tcfg.patience > 0 and patience_counter >= tcfg.patience:
                 print(f"  ↳ Early stopping: no improvement for {tcfg.patience} eval cycles")
@@ -411,8 +386,6 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "config": cfg.to_dict(),
             }
-            if ema is not None:
-                ckpt["ema"] = ema.state_dict()
             if scheduler is not None:
                 ckpt["scheduler"] = scheduler.state_dict()
             if amp_enabled:
@@ -429,8 +402,6 @@ def main():
         if revin is not None and "revin" in best_ckpt:
             revin.load_state_dict(best_ckpt["revin"])
         print("Loaded best checkpoint for testing")
-    elif ema is not None:
-        ema.apply_shadow()
 
     stop_step = None
     if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
@@ -447,7 +418,6 @@ def main():
 
     test_metrics = evaluate(model, test_loader, device, revin=revin,
                             num_samples=tcfg.num_samples, stop_step=stop_step,
-                            sampling_stride=tcfg.sampling_stride,
                             eval_length=tcfg.eval_prediction_length,
                             use_early_stop=tcfg.use_early_stop,
                             early_stop_safety_margin=tcfg.early_stop_safety_margin)
