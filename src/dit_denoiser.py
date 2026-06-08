@@ -317,6 +317,8 @@ class DiTDenoiser(nn.Module):
         cond: Tensor,
         tau: Optional[Tensor] = None,
         delta: Optional[Tensor] = None,
+        mean: Optional[Tensor] = None,
+        std: Optional[Tensor] = None,
         sample_mode: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """
@@ -376,4 +378,6 @@ class DiTDenoiser(nn.Module):
 
         y0_out = rearrange(y0_out, "(b c) l -> b l c", b=B, c=C)
         delta_out = rearrange(delta_out, "(b c) l -> b l c", b=B, c=C)
+        y0_out = y0_out * std + mean if (mean is not None and std is not None) else y0_out
+        delta_out = delta_out * std + mean if (mean is not None and std is not None) else delta_out
         return y0_out, delta_out

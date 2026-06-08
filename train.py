@@ -73,7 +73,7 @@ def evaluate(
                              eval_prediction_length=eval_length,
                              use_early_stop=use_early_stop,
                              early_stop_safety_margin=early_stop_safety_margin,
-                             tau=tau, delta=delta)
+                             tau=tau, delta=delta, mean=revin.mean, std=revin.stdev)
 
         # if revin is not None:
         #     pred = revin(pred, mode="denorm")
@@ -306,7 +306,7 @@ def main():
             optimizer.zero_grad()
 
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss_dict = model(tgt, ctx, tau, delta)
+                loss_dict = model(tgt, ctx, tau, delta, revin.mean, revin.stdev) if revin is not None else model(tgt, ctx)
                 loss = loss_dict["total"]
 
             if amp_enabled:
@@ -345,7 +345,7 @@ def main():
                 es_result = model.find_optimal_stop_step(
                     pilot_ctx, num_samples=tcfg.num_samples,
                     safety_margin=tcfg.early_stop_safety_margin,
-                    tau=tau, delta=delta,
+                    tau=tau, delta=delta, mean=revin.mean, std=revin.stdev
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
@@ -416,7 +416,7 @@ def main():
         es_result = model.find_optimal_stop_step(
             pilot_ctx, num_samples=tcfg.num_samples,
             safety_margin=tcfg.early_stop_safety_margin,
-            tau=tau, delta=delta,
+            tau=tau, delta=delta, mean=revin.mean, std=revin.stdev
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")
