@@ -423,8 +423,7 @@ class FFTDiffusion(nn.Module):
 
     # ── Training forward ─────────────────────────────────────────────────
 
-    def forward(self, y: Tensor, context: Tensor, tau: Optional[Tensor] = None, delta: Optional[Tensor] = None,
-                mean: Optional[Tensor] = None, std: Optional[Tensor] = None):
+    def forward(self, y: Tensor, context: Tensor, tau: Optional[Tensor] = None, delta: Optional[Tensor] = None):
         """
         Training step — block-diffusion aware.
 
@@ -474,7 +473,7 @@ class FFTDiffusion(nn.Module):
             t_input = t
 
         # ── Main denoiser forward ─────────────────────────────────────────
-        y0_pred, delta_pred = self.denoiser(y_input, t_input, cond, tau=tau, delta=delta, mean=mean, std=std)
+        y0_pred, delta_pred = self.denoiser(y_input, t_input, cond, tau=tau, delta=delta)
         rec_loss = torch.zeros_like(y)
         if self.causal:
             rec_loss = F.mse_loss(y0_pred[:, self.max_prediction_length:, :], y, reduction="none")
@@ -517,8 +516,6 @@ class FFTDiffusion(nn.Module):
         early_stop_safety_margin: int = 0,
         tau: Optional[Tensor] = None,
         delta: Optional[Tensor] = None,
-        mean: Optional[Tensor] = None,
-        std: Optional[Tensor] = None,
     ):
         """
         Generate forecasts.
@@ -567,17 +564,17 @@ class FFTDiffusion(nn.Module):
 
         if not self.causal:
             return self._sample_full(
-                cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores, tau, delta, mean, std)
+                cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores, tau, delta)
 
         return self._sample_block_semi_ar(
             cond, B_eff, C, device, eval_len, num_samples,
             return_scores=return_scores,
             use_early_stop=use_early_stop,
             early_stop_safety_margin=early_stop_safety_margin,
-            tau=tau, delta=delta, mean=mean, std=std
+            tau=tau, delta=delta,
         )
 
-    def _sample_full(self, cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores, tau, delta, mean, std):
+    def _sample_full(self, cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores, tau, delta):
         """Full-sequence DDIM sampling; eval_len may be < max_prediction_length."""
         y_t = torch.randn(B_eff, eval_len, C, device=device)
 
@@ -592,7 +589,7 @@ class FFTDiffusion(nn.Module):
             t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
 
             t_input = t_b.unsqueeze(1).expand(B_eff, eval_len)
-            y0_pred, delta_pred = self.denoiser(y_t, t_input, cond, tau=tau, delta=delta, mean=mean, std=std)
+            y0_pred, delta_pred = self.denoiser(y_t, t_input, cond, tau=tau, delta=delta)
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
             candidate = y0_pred + delta_pred
 
@@ -640,8 +637,6 @@ class FFTDiffusion(nn.Module):
         early_stop_safety_margin: int = 0,
         tau: Optional[Tensor] = None,
         delta: Optional[Tensor] = None,
-        mean: Optional[Tensor] = None,
-        std: Optional[Tensor] = None,
     ):
         """
         Semi-AR block sampling — faithful BD3LM-style.
@@ -712,7 +707,7 @@ class FFTDiffusion(nn.Module):
                 t_input[:, b_start:b_end] = t_now
 
                 y0_pred, delta_pred = self.denoiser(
-                    y_input, t_input, cond, tau=tau, delta=delta, mean=mean, std=std, sample_mode=True)
+                    y_input, t_input, cond, tau=tau, delta=delta, sample_mode=True)
                 # y0_pred / delta_pred: [B_eff, b_end, C] — use last block only
                 candidate_b = y0_pred[:, b_start:b_end] + delta_pred[:, b_start:b_end]
 
@@ -811,8 +806,6 @@ class FFTDiffusion(nn.Module):
         safety_margin: int = 0,
         tau: Optional[Tensor] = None,
         delta: Optional[Tensor] = None,
-        mean: Optional[Tensor] = None,
-        std: Optional[Tensor] = None
     ) -> dict:
         """
         Run pilot samples through full diffusion to find the optimal
@@ -827,7 +820,7 @@ class FFTDiffusion(nn.Module):
             return {"stop_step": None}
 
         _, scores, steps = self.sample(
-            pilot_contexts, num_samples=num_samples, return_scores=True, tau=tau, delta=delta, mean=mean, std=std
+            pilot_contexts, num_samples=num_samples, return_scores=True, tau=tau, delta=delta,
         )
         return find_global_early_stop(
             scores=scores, steps=steps,

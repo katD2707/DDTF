@@ -66,14 +66,15 @@ def evaluate(
     for ctx, tgt in loader:
         ctx, tgt = ctx.to(device), tgt.to(device)
 
+        tau, delta = None, None
         if revin is not None:
-            ctx, tau, delta = revin(ctx, mode="norm")
+            _, tau, delta = revin(ctx, mode="norm")
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
                              eval_prediction_length=eval_length,
                              use_early_stop=use_early_stop,
                              early_stop_safety_margin=early_stop_safety_margin,
-                             tau=tau, delta=delta, mean=revin.mean, std=revin.stdev)
+                             tau=tau, delta=delta)
 
         # if revin is not None:
         #     pred = revin(pred, mode="denorm")
@@ -301,12 +302,12 @@ def main():
 
             # RevIN: normalize context and target for training
             if revin is not None:
-                ctx, tau, delta = revin(ctx, mode="norm")
+                _, tau, delta = revin(ctx, mode="norm")
 
             optimizer.zero_grad()
 
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss_dict = model(tgt, ctx, tau, delta, revin.mean, revin.stdev) if revin is not None else model(tgt, ctx)
+                loss_dict = model(tgt, ctx, tau, delta) if revin is not None else model(tgt, ctx)
                 loss = loss_dict["total"]
 
             if amp_enabled:
@@ -345,7 +346,7 @@ def main():
                 es_result = model.find_optimal_stop_step(
                     pilot_ctx, num_samples=tcfg.num_samples,
                     safety_margin=tcfg.early_stop_safety_margin,
-                    tau=tau, delta=delta, mean=revin.mean, std=revin.stdev
+                    tau=tau, delta=delta,
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
@@ -416,7 +417,7 @@ def main():
         es_result = model.find_optimal_stop_step(
             pilot_ctx, num_samples=tcfg.num_samples,
             safety_margin=tcfg.early_stop_safety_margin,
-            tau=tau, delta=delta, mean=revin.mean, std=revin.stdev
+            tau=tau, delta=delta,
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")
