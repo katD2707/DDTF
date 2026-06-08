@@ -85,6 +85,8 @@ class AdaLNBlock(nn.Module):
         c: Tensor,
         ctx: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
+        tau: Optional[Tensor] = None,
+        delta: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
@@ -94,6 +96,8 @@ class AdaLNBlock(nn.Module):
             ctx:       [B, S, D]   cross-attention context (history encoder)
             attn_mask: [L, L] bool, True = allowed to attend (BD3LMS mask);
                        None → unrestricted (full mode, SA sublayer absent)
+            tau:       [B, 1]   optional de-stationary parameter
+            delta:     [B, L]   optional de-stationary parameter
         """
         B, L, D = x.shape
         mods = self.adaLN(c).chunk(9 if self.use_causal_block_attn else 6, dim=-1)
@@ -105,13 +109,27 @@ class AdaLNBlock(nn.Module):
 
             # ── Block SA: SDPA over full [y_t | y_kv] sequence ───────────
             h   = modulate(self.norm_sa(x), shift_sa, scale_sa)
-            qkv = self.sa_qkv_proj(h).reshape(B, L, 3, self.n_heads, self.head_dim).transpose(1, 3) # each [B, H, 3, L, D_h]
-            sa_out = F.scaled_dot_product_attention(
-                qkv[:,:,0], qkv[:,:,1], qkv[:,:,2],
-                attn_mask=attn_mask,                     # [L, L] bool → broadcasts
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False,
-            )
+            qkv = self.sa_qkv_proj(h).reshape(B, L, 3, self.n_heads, self.head_dim).transpose(1, 3) # each [B, H, L, D_h]
+            queries, keys, values = qkv[:,:,0], qkv[:,:,1], qkv[:,:,2]
+            
+            # Compute attention scores: [B, H, L, L]
+            scores = torch.einsum("...ld,...sd->...ls", queries, keys) / math.sqrt(self.head_dim)
+            
+            # Apply de-stationary factors if provided (pre-softmax)
+            tau = 1.0 if tau is None else tau.reshape(B, 1, 1, 1)  # reshape for broadcasting
+            delta = 0.0 if delta is None else delta.reshape(B, 1, 1, -1)  # reshape for broadcasting
+            scores = scores * tau
+            
+            # Apply attention mask
+            if attn_mask is not None:
+                scores.masked_fill_(~attn_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            
+            # Softmax and dropout
+            attn_weights = torch.softmax(scores, dim=-1)
+            if self.training:
+                attn_weights = F.dropout(attn_weights, p=self.dropout, training=True)
+            
+            sa_out = torch.einsum("...ij,...jd->...id", attn_weights, values)
             sa_out = sa_out.transpose(1, 2).reshape(B, L, D)
             sa_out = self.sa_out_proj(sa_out)
             x = x + gate_sa * sa_out
@@ -124,11 +142,20 @@ class AdaLNBlock(nn.Module):
         kv_in = ctx if ctx is not None else h
         S     = kv_in.shape[1]
         kv    = self.ca_kv_proj(kv_in).reshape(B, S, 2, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        attn_out = F.scaled_dot_product_attention(
-            q, kv[0], kv[1],
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
-        )
+        k, v  = kv[0], kv[1]  # [B, H, S, D_h]
+        
+        # Compute attention scores: [B, H, L, S]
+        scores = torch.einsum("...ld,...sd->...ls", q, k) / math.sqrt(self.head_dim)
+        
+        # Apply de-stationary factors if provided (pre-softmax)
+        scores = scores * tau + delta
+        
+        # Softmax and dropout
+        attn_weights = torch.softmax(scores, dim=-1)
+        if self.training:
+            attn_weights = F.dropout(attn_weights, p=self.dropout, training=True)
+        
+        attn_out = torch.einsum("...ij,...jd->...id", attn_weights, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         attn_out = self.proj(attn_out)
         x = x + gate_ca * attn_out
@@ -288,6 +315,8 @@ class DiTDenoiser(nn.Module):
         input: Tensor,
         t: Tensor,
         cond: Tensor,
+        tau: Optional[Tensor] = None,
+        delta: Optional[Tensor] = None,
         sample_mode: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """
@@ -298,6 +327,7 @@ class DiTDenoiser(nn.Module):
                            sample_mode     → L = b_end  (growing window)
             t:           [B, L]  per-position timesteps; encoding mirrors L
             cond:        [B, C, P_ctx, D_cond]  encoder output
+            tau, delta:  optional pre-computed de-stationary parameters for the input
             sample_mode: if True, use growing-window inference.
                          Both training halves are patchified separately from
                          position 0, so past clean blocks in the growing window
@@ -311,6 +341,8 @@ class DiTDenoiser(nn.Module):
         B, L, C = input.shape
 
         t_rep = repeat(t, "b l -> (b c) l", c=C)
+        tau = rearrange(tau, "b 1 c -> (b c) 1") if tau is not None else None
+        delta = rearrange(delta, "b l c -> (b c) l") if delta is not None else None
         if self.use_causal_block_attn:
             # Training: split [y_t | y_kv] and patchify each half from position 0.
             # y_kv block b gets the same positional indices as block b in the
@@ -337,7 +369,7 @@ class DiTDenoiser(nn.Module):
         cond_emb = self.context_proj(rearrange(cond, "b c p d -> (b c) p d"))
         c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
         for block in self.blocks:
-            h = block(h, c, cond_emb, attn_mask=attn_mask)
+            h = block(h, c, cond_emb, attn_mask=attn_mask, tau=tau, delta=delta)
 
         y0_out = self.final_layer(h, c).flatten(-2)
         delta_out = self.delta_head(h, c).flatten(-2)

@@ -67,12 +67,13 @@ def evaluate(
         ctx, tgt = ctx.to(device), tgt.to(device)
 
         if revin is not None:
-            ctx = revin(ctx, mode="norm")
+            ctx, tau, delta = revin(ctx, mode="norm")
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
                              eval_prediction_length=eval_length,
                              use_early_stop=use_early_stop,
-                             early_stop_safety_margin=early_stop_safety_margin)
+                             early_stop_safety_margin=early_stop_safety_margin,
+                             tau=tau, delta=delta)
 
         # if revin is not None:
         #     pred = revin(pred, mode="denorm")
@@ -112,7 +113,8 @@ def parse_args():
     parser.add_argument("--mlp_ratio", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--use_revin", action="store_true", default=None)
-    parser.add_argument("--no_revin", dest="use_revin", action="store_false")
+    parser.add_argument("--use_de_stationary", action="store_true", default=None,
+                        help="Enable learned de-stationary projector (tau/delta)")
     parser.add_argument("--num_diffusion_steps", type=int, default=None)
     parser.add_argument("--num_sampling_steps", type=int, default=None)
     parser.add_argument("--num_fft_stages", type=int, default=None)
@@ -219,7 +221,8 @@ def main():
     # ── RevIN ─────────────────────────────────────────────────────────────
     revin = None
     if mcfg.use_revin:
-        revin = RevIN(num_features=mcfg.num_features, affine=mcfg.revin_affine).to(device)
+        revin = RevIN(num_features=mcfg.num_features, affine=mcfg.revin_affine, 
+                      use_de_stationary=mcfg.use_de_stationary).to(device)
         print("RevIN enabled")
 
     # ── Optimizer & Scheduler ─────────────────────────────────────────────
@@ -297,13 +300,12 @@ def main():
 
             # RevIN: normalize context and target for training
             if revin is not None:
-                ctx = revin(ctx, mode="norm")
-                # tgt = revin(tgt, mode="norm", reuse_stats=True)
+                ctx, tau, delta = revin(ctx, mode="norm")
 
             optimizer.zero_grad()
 
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss_dict = model(tgt, ctx)
+                loss_dict = model(tgt, ctx, tau, delta)
                 loss = loss_dict["total"]
 
             if amp_enabled:
@@ -338,10 +340,11 @@ def main():
                 pilot_ctx, _ = next(iter(val_loader))
                 pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
                 if revin is not None:
-                    pilot_ctx = revin(pilot_ctx, mode="norm")
+                    pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
                 es_result = model.find_optimal_stop_step(
                     pilot_ctx, num_samples=tcfg.num_samples,
                     safety_margin=tcfg.early_stop_safety_margin,
+                    tau=tau, delta=delta,
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
@@ -408,10 +411,11 @@ def main():
         pilot_ctx, _ = next(iter(val_loader))
         pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
         if revin is not None:
-            pilot_ctx = revin(pilot_ctx, mode="norm")
+            pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
         es_result = model.find_optimal_stop_step(
             pilot_ctx, num_samples=tcfg.num_samples,
             safety_margin=tcfg.early_stop_safety_margin,
+            tau=tau, delta=delta,
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")

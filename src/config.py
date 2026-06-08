@@ -99,6 +99,11 @@ class ModelConfig:
     # Common
     dropout: float = 0.1
 
+    # De-stationary (learned projector for tau/delta)
+    use_de_stationary: bool = False
+    p_hidden_dims: List[int] = field(default_factory=lambda: [128, 128])
+    p_hidden_layers: int = 2
+
     # Diffusion (FFT-based f-DM)
     num_diffusion_steps: int = 50
     num_sampling_steps: int = 10

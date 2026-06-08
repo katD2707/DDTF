@@ -16,6 +16,7 @@ model:
   # RevIN (instance normalization for distribution shift)
   use_revin: false
   revin_affine: false
+  use_de_stationary: false
 
   d_model_encoder: 128
   n_encoder_layers: 2
