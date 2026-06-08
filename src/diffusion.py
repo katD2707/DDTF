@@ -474,8 +474,9 @@ class FFTDiffusion(nn.Module):
 
         # ── Main denoiser forward ─────────────────────────────────────────
         y0_pred, delta_pred = self.denoiser(y_input, t_input, cond, tau=tau, delta=delta)
-        rec_loss = F.mse_loss(y0_pred[:, self.max_prediction_length:, :], y, reduction="none")
+        rec_loss = torch.zeros_like(y)
         if self.causal:
+            rec_loss = F.mse_loss(y0_pred[:, self.max_prediction_length:, :], y, reduction="none")
             y0_pred = y0_pred[:, :self.max_prediction_length, :]
             delta_pred = delta_pred[:, :self.max_prediction_length, :]
         
@@ -856,7 +857,4 @@ class FFTDiffusion(nn.Module):
             ma_kernel_size=cfg.ma_kernel_size,
             block_diffusion_mode=getattr(cfg, "block_diffusion_mode", "full"),
             block_size=getattr(cfg, "block_size", None),
-            use_de_stationary=getattr(cfg, "use_de_stationary", False),
-            p_hidden_dims=getattr(cfg, "p_hidden_dims", None),
-            p_hidden_layers=getattr(cfg, "p_hidden_layers", 2),
         )

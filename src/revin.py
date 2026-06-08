@@ -43,7 +43,7 @@ class Projector(nn.Module):
         # Compute global mean from raw data: [B, L, C] -> [B, C]
         x = self.series_conv(x_raw)  # [B, 1, C]
         # Concatenate mean of raw data with provided stats (std or mean)
-        feat = torch.cat([x, stats], dim=-1)  # [B, 2, C]
+        feat = torch.cat([x, stats], dim=1)  # [B, 2, C]
         return self.backbone(feat.transpose(1, 2)).transpose(1, 2)  # [B, output_dim, C]
 
 
@@ -63,7 +63,7 @@ class RevIN(nn.Module):
         Input / Output: (B, L, C)
     """
 
-    def __init__(self, num_features: int, seq_len: int, eps: float = 1e-5, affine: bool = False,
+    def __init__(self, num_features: int, in_len: int, out_len: int, eps: float = 1e-5, affine: bool = False,
                  use_de_stationary: bool = False, p_hidden_dims: List[int] = [128, 128], p_hidden_layers: int = 2):
         super().__init__()
         self.num_features = num_features
@@ -77,12 +77,12 @@ class RevIN(nn.Module):
 
         if self.use_de_stationary:
             self.tau_learner = Projector(
-                    seq_len=seq_len, output_dim=1,
+                    seq_len=in_len, output_dim=1,
                     hidden_dims=p_hidden_dims,
                     hidden_layers=p_hidden_layers
                 )
             self.delta_learner = Projector(
-                seq_len=seq_len, output_dim=seq_len,
+                seq_len=in_len, output_dim=out_len,
                 hidden_dims=p_hidden_dims,
                 hidden_layers=p_hidden_layers,
             )

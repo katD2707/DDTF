@@ -221,8 +221,9 @@ def main():
     # ── RevIN ─────────────────────────────────────────────────────────────
     revin = None
     if mcfg.use_revin:
-        revin = RevIN(num_features=mcfg.num_features, affine=mcfg.revin_affine, 
-                      use_de_stationary=mcfg.use_de_stationary).to(device)
+        revin = RevIN(num_features=mcfg.num_features, in_len=mcfg.context_length, out_len=model.condition_encoder.num_patches,
+                      affine=mcfg.revin_affine, use_de_stationary=mcfg.use_de_stationary,
+                      p_hidden_dims=mcfg.p_hidden_dims, p_hidden_layers=mcfg.p_hidden_layers).to(device)
         print("RevIN enabled")
 
     # ── Optimizer & Scheduler ─────────────────────────────────────────────
