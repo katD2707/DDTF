@@ -101,6 +101,8 @@ class AdaLNBlock(nn.Module):
         """
         B, L, D = x.shape
         mods = self.adaLN(c).chunk(9 if self.use_causal_block_attn else 6, dim=-1)
+        tau = 1.0 if tau is None else tau.reshape(B, 1, 1, 1)  # reshape for broadcasting
+        delta = 0.0 if delta is None else delta.reshape(B, 1, 1, -1)  # reshape for broadcasting
 
         if self.use_causal_block_attn:
             shift_sa, scale_sa, gate_sa, \
@@ -116,8 +118,6 @@ class AdaLNBlock(nn.Module):
             scores = torch.einsum("...ld,...sd->...ls", queries, keys) / math.sqrt(self.head_dim)
             
             # Apply de-stationary factors if provided (pre-softmax)
-            tau = 1.0 if tau is None else tau.reshape(B, 1, 1, 1)  # reshape for broadcasting
-            delta = 0.0 if delta is None else delta.reshape(B, 1, 1, -1)  # reshape for broadcasting
             scores = scores * tau
             
             # Apply attention mask
@@ -353,6 +353,7 @@ class DiTDenoiser(nn.Module):
                 attn_mask = attn_mask[self.num_target_patches:self.num_target_patches+h.shape[1],
                                       self.num_target_patches:self.num_target_patches+h.shape[1]]
                 h = h + self.positional_embedding(h)
+                c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
             else:
                 h_yt  = self.patch_embedding(input[:, :L // 2])
                 h_ykv = self.patch_embedding(input[:, L // 2:])
@@ -360,14 +361,16 @@ class DiTDenoiser(nn.Module):
                 h_yt = h_yt + pos_emb
                 h_ykv = h_ykv + pos_emb
                 h = torch.cat([h_yt, h_ykv], dim=1)
+                c = self.timestep_emb(t_rep[:, :L // 2])    # [B*C, P_in, D]
+                c = torch.cat([c, c], dim=1)
         else:
             # Inference growing window: patchify [0..b_end] from position 0.
             attn_mask = None
             h = self.patch_embedding(input)  # [B*C, P_in, D]
             h = h + self.positional_embedding(h)
+            c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
 
         cond_emb = self.context_proj(rearrange(cond, "b c p d -> (b c) p d"))
-        c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
         for block in self.blocks:
             h = block(h, c, cond_emb, attn_mask=attn_mask, tau=tau, delta=delta)
 

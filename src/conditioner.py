@@ -64,6 +64,7 @@ class ConditionEncoder(nn.Module):
         d_model: int,
         n_layers: int,
         n_heads: int,
+        mlp_ratio: int = 1,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -71,7 +72,7 @@ class ConditionEncoder(nn.Module):
         self.pos_emb = PositionalEmbedding(d_model)
         self.num_patches = self.patch_emb.compute_num_patches(context_length)
         self.blocks = nn.ModuleList([
-            ConditionBlock(d_model, n_heads, dropout=dropout)
+            ConditionBlock(d_model, n_heads, mlp_ratio, dropout=dropout)
             for _ in range(n_layers)
         ])
 

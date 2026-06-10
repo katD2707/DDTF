@@ -93,7 +93,7 @@ class RevIN(nn.Module):
     def forward(self, x: Tensor, mode: str, reuse_stats: bool = False) -> Tensor:
         if mode == "norm":
             x_norm = self._normalize(x, reuse_stats)
-            if self.use_de_stationary:
+            if self.use_de_stationary and not reuse_stats:
                 return x_norm, self.tau_learner(x, self.stdev).exp(), self.delta_learner(x, self.mean)
             return x_norm, None, None
         elif mode == "denorm":

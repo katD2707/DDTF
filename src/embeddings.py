@@ -84,7 +84,7 @@ class PatchEmbedding(nn.Module):
         return x
 
     def compute_num_patches(self, seq_len: int) -> int:
-        return (seq_len + self.stride - 1) // self.stride
+        return (seq_len - self.patch_size) // self.stride + 1
 
 
 # ── Timestep Embedding ───────────────────────────────────────────────────────

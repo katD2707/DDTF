@@ -60,7 +60,6 @@ class TimeSeriesDataset(Dataset):
         data: Array of shape [T, C].
         context_length: Historical window length.
         prediction_length: Forecast horizon length.
-        stride: Step between consecutive windows.
         scale: Whether to standardise.
         scaler: Pre-fitted scaler (for val/test).
     """

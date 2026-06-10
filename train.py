@@ -68,7 +68,7 @@ def evaluate(
 
         tau, delta = None, None
         if revin is not None:
-            _, tau, delta = revin(ctx, mode="norm")
+            ctx, tau, delta = revin(ctx, mode="norm")
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
                              eval_prediction_length=eval_length,
@@ -76,8 +76,8 @@ def evaluate(
                              early_stop_safety_margin=early_stop_safety_margin,
                              tau=tau, delta=delta)
 
-        # if revin is not None:
-        #     pred = revin(pred, mode="denorm")
+        if revin is not None:
+            pred = revin(pred, mode="denorm")
             # tgt is already in original scale (not normalized)
 
         all_preds.append(pred.cpu())
@@ -302,7 +302,8 @@ def main():
 
             # RevIN: normalize context and target for training
             if revin is not None:
-                _, tau, delta = revin(ctx, mode="norm")
+                ctx, tau, delta = revin(ctx, mode="norm")
+                tgt, _, _ = revin(tgt, mode="norm", reuse_stats=True)
 
             optimizer.zero_grad()
 
@@ -313,12 +314,14 @@ def main():
             if amp_enabled:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), tcfg.gradient_clip)
+                if tcfg.gradient_clip > 0.0:
+                    nn.utils.clip_grad_norm_(model.parameters(), tcfg.gradient_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), tcfg.gradient_clip)
+                if tcfg.gradient_clip > 0.0:
+                    nn.utils.clip_grad_norm_(model.parameters(), tcfg.gradient_clip)
                 optimizer.step()
 
             if scheduler is not None and tcfg.lr_scheduler == "cosine":
@@ -341,6 +344,7 @@ def main():
             if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
                 pilot_ctx, _ = next(iter(val_loader))
                 pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
+                tau, delta = None, None
                 if revin is not None:
                     pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
                 es_result = model.find_optimal_stop_step(

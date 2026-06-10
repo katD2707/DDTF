@@ -11,6 +11,7 @@ Reference: f-DM (Gu et al., 2022) — arXiv:2210.04955
 import math
 from typing import Optional, Tuple
 import random
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -319,7 +320,7 @@ class FFTDiffusion(nn.Module):
 
         # Sub-modules
         self.condition_encoder = ConditionEncoder(
-            context_length, patch_size, d_model_encoder, n_encoder_layers, n_heads, dropout,
+            context_length, patch_size, d_model_encoder, n_encoder_layers, n_heads, mlp_ratio, dropout,
         )
         self.denoiser = DiTDenoiser(
             max_prediction_length=max_prediction_length,
@@ -473,22 +474,24 @@ class FFTDiffusion(nn.Module):
             t_input = t
 
         # ── Main denoiser forward ─────────────────────────────────────────
+        # loss_fn = F.mse_loss
+        loss_fn = F.l1_loss
         y0_pred, delta_pred = self.denoiser(y_input, t_input, cond, tau=tau, delta=delta)
         rec_loss = torch.zeros_like(y)
         if self.causal:
-            rec_loss = F.mse_loss(y0_pred[:, self.max_prediction_length:, :], y, reduction="none")
+            rec_loss = loss_fn(y0_pred[:, self.max_prediction_length:, :], y, reduction="none")
             y0_pred = y0_pred[:, :self.max_prediction_length, :]
             delta_pred = delta_pred[:, :self.max_prediction_length, :]
         
         # Losses
-        stage_loss = F.mse_loss(y0_pred, y_target, reduction="none")
+        stage_loss = loss_fn(y0_pred, y_target, reduction="none")
         fft1 = torch.fft.fft(y0_pred.transpose(1, 2), norm='forward')
         fft2 = torch.fft.fft(y_target.transpose(1, 2), norm='forward')
         fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
-        fourier_loss = F.mse_loss(torch.real(fft1), torch.real(fft2), reduction='none') \
-                        + F.mse_loss(torch.imag(fft1), torch.imag(fft2), reduction='none')
+        fourier_loss = loss_fn(torch.real(fft1), torch.real(fft2), reduction='none') \
+                        + loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
         stage_loss +=  1.0 * fourier_loss
-        degrad_loss = F.mse_loss(delta_pred, delta_target, reduction="none")
+        degrad_loss = loss_fn(delta_pred, delta_target, reduction="none")
 
         # Filter outliers
         stage_loss = stage_loss[stage_loss < 100].mean()
