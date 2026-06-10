@@ -74,7 +74,7 @@ python train.py --csv data/ETTh1.csv --use_early_stop --num_pilot_samples 64
 | `--num_fft_stages` | `8` | Number of FFT degradation stages K |
 | `--stage_schedule` | `linear` | Stage boundary schedule |
 | `--topk_schedule` | `linear` | Top-k frequency schedule |
-| `--noise_schedule` | `linear` | Beta schedule: `linear`, `cosine`, `quad`, `sigmoid` |
+| `--noise_schedule` | `linear` | Beta schedule: `linear`, `cosine`, `quad`, `sigmoid`, `exp`|
 | `--beta_start` | `1e-4` | Starting beta value |
 | `--beta_end` | `0.1` | Ending beta value |
 | `--eta` | `1.0` | DDIM eta (0 = deterministic) |

@@ -109,7 +109,7 @@ class ModelConfig:
     num_sampling_steps: int = 10
     beta_start: float = 1e-4
     beta_end: float = 0.1
-    noise_schedule: Literal["linear", "cosine", "quad", "sigmoid"] = "linear"
+    noise_schedule: Literal["linear", "cosine", "quad", "sigmoid", "exp"] = "linear"
     num_fft_stages: int = 8
     stage_schedule: Literal["linear", "cosine", "quadratic", "sqrt"] = "linear"
     topk_schedule: Literal["linear", "cosine", "quadratic", "sqrt"] = "linear"

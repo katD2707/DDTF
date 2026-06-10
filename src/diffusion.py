@@ -42,6 +42,18 @@ def make_beta_schedule(schedule: str, T: int, start: float = 1e-4, end: float = 
         s = 0.008
         ab = lambda t: math.cos((t + s) / (1 + s) * math.pi / 2) ** 2
         return torch.tensor([min(1 - ab((i + 1) / T) / ab(i / T), 0.999) for i in range(T)])
+    elif schedule == "exp":
+        lambd = 5.0
+        gamma = 0.9
+        t = torch.linspace(0, 1, T + 1)
+
+        alpha_bar = torch.exp(-lambd * (t ** gamma))
+        alpha_bar[0] = 1.0
+
+        betas = 1.0 - alpha_bar[1:] / alpha_bar[:-1]
+        betas = torch.clamp(betas, min=start, max=0.999)
+
+        return betas
     raise ValueError(f"Unknown schedule: {schedule}")
 
 
