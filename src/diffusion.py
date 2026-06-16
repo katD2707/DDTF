@@ -615,11 +615,9 @@ class FFTDiffusion(nn.Module):
 
             # Early stopping
             if not return_scores and stop_step is not None and t_now <= stop_step:
-                y_t = candidate
                 break
 
             if t_next < 0:
-                y_t = candidate
                 break
 
             # Apply delta correction scaled for step size
@@ -636,13 +634,13 @@ class FFTDiffusion(nn.Module):
             y_t = y0_corr * alpha_s.sqrt() + c_coef * noise_pred + sigma * torch.randn_like(y_t)
 
         if num_samples > 1:
-            y_t = rearrange(y_t, "(b n) l c -> b n l c", n=num_samples).mean(1)
+            candidate = rearrange(candidate, "(b n) l c -> b n l c", n=num_samples).mean(1)
 
         if return_scores:
             scores = torch.stack(all_scores, dim=1)
-            steps_t = torch.tensor(all_steps, device=y_t.device, dtype=torch.float)
-            return y_t, scores, steps_t
-        return y_t
+            steps_t = torch.tensor(all_steps, device=candidate.device, dtype=torch.float)
+            return candidate, scores, steps_t
+        return candidate
 
     @torch.no_grad()
     def _sample_block_semi_ar(
@@ -705,7 +703,7 @@ class FFTDiffusion(nn.Module):
             es_score_list: list = []      # for inline ES: [S] × Tensor[B]
             es_steps_list: list = []      # for inline ES: [S] float timesteps
 
-            for t_now, t_next in pairs:
+            for it, (t_now, t_next) in enumerate(pairs):
                 t_b  = torch.full((B_eff,), t_now,  device=device, dtype=torch.long)
                 t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
 
@@ -739,7 +737,7 @@ class FFTDiffusion(nn.Module):
                         es_score_list.append(score)
                         es_steps_list.append(float(t_now))
 
-                if t_next < 0:
+                if it == self.num_sampling_steps - 1:
                     y_gen[:, b_start:b_end] = candidate_b
                     break
 
