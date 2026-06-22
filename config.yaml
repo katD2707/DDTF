@@ -48,6 +48,9 @@ model:
   #   fixed  → fixed block_size; must divide prediction_length and patch_size
   block_diffusion_mode: fixed   # full | fixed
   block_size: 96             # int; required when block_diffusion_mode=fixed, default=patch_size
+  # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
+  bernoulli_sampling: false
+  bernoulli_p: 0.7
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:

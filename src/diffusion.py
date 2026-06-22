@@ -304,6 +304,9 @@ class FFTDiffusion(nn.Module):
         # Block diffusion
         block_diffusion_mode: str = "full",
         block_size: Optional[int] = None,
+        # Bernoulli timestep sampling
+        bernoulli_sampling: bool = False,
+        bernoulli_p: float = 0.7,
     ):
         super().__init__()
         self.context_length = context_length
@@ -316,6 +319,9 @@ class FFTDiffusion(nn.Module):
         self.transform_type = transform_type
         self._topk_schedule = topk_schedule
         self.causal = block_diffusion_mode != "full"
+        self.bernoulli_sampling = bernoulli_sampling
+        self.bernoulli_p = bernoulli_p
+        self._t_delta: Optional[int] = None  # set dynamically from stop_step
 
         # ── Block diffusion configuration ───────────────────────────────────
         assert block_diffusion_mode in ("full", "fixed"), (
@@ -394,6 +400,30 @@ class FFTDiffusion(nn.Module):
             return self._fixed_block_size
         return self.max_prediction_length
 
+    def _sample_timestep_bernoulli(self, batch_size: int, device) -> Tensor:
+        """Bernoulli-gated non-uniform timestep sampling (flipped ranges).
+
+        Adapted from DDPM-BS (Zheng et al., ACM MM 2024) with flipped
+        interval assignment:
+          - With prob p:   t ~ Uniform[t_delta, T-1]   (high-noise)
+          - With prob 1-p: t ~ Uniform[1, t_delta]     (low-noise)
+
+        ``_t_delta`` is derived from the early-stopping stop_step and
+        updated externally by the training loop after each evaluation.
+        """
+        T = self.num_diffusion_steps
+        t_delta = self._t_delta  # guaranteed not None by caller
+
+        u = torch.rand(batch_size, device=device)
+
+        # High-noise branch: [t_delta, T-1]
+        t_high = torch.randint(t_delta, T, (batch_size,), device=device)
+        # Low-noise branch: [0, t_delta]  (inclusive, so upper bound is t_delta + 1 for randint)
+        t_low = torch.randint(0, t_delta, (batch_size,), device=device)
+
+        t = torch.where(u <= self.bernoulli_p, t_high, t_low)
+        return t
+
     def q_sample(self, y0: Tensor, t: Tensor, noise: Optional[Tensor] = None) -> Tensor:
         """
         q_sample with per-position (per-block) diffusion timestep.
@@ -454,10 +484,17 @@ class FFTDiffusion(nn.Module):
         cond = self.condition_encoder(context, tau=tau, delta=delta)
 
         # ── Timestep sampling ───────────────────────
+        _use_bernoulli = (self.bernoulli_sampling and self._t_delta is not None)
+
         if self.causal:
             num_blocks = self.max_prediction_length // self.block_size
-            t_per_block = torch.randint(
-                0, self.num_diffusion_steps, (B, num_blocks), device=device)
+            if _use_bernoulli:
+                # Sample each block's timestep via Bernoulli gating
+                t_per_block = self._sample_timestep_bernoulli(
+                    B * num_blocks, device).reshape(B, num_blocks)
+            else:
+                t_per_block = torch.randint(
+                    0, self.num_diffusion_steps, (B, num_blocks), device=device)
             t = t_per_block.repeat_interleave(self.block_size, dim=1)  # [B, pred_len]
             
             y_flat = y.reshape(B * num_blocks, self.block_size, C)
@@ -467,8 +504,11 @@ class FFTDiffusion(nn.Module):
             y_target = y_target_flat.reshape(B, self.max_prediction_length, C)
             y_k      = y_k_flat.reshape(B, self.max_prediction_length, C)
         else:
-            t_scalar = torch.randint(
-                0, self.num_diffusion_steps, (B,), device=device)
+            if _use_bernoulli:
+                t_scalar = self._sample_timestep_bernoulli(B, device)
+            else:
+                t_scalar = torch.randint(
+                    0, self.num_diffusion_steps, (B,), device=device)
             y_target, y_k = self._compute_xt(y, t_scalar)
             t = t_scalar.unsqueeze(1).expand(B, self.max_prediction_length)
         delta_target = y_k - y_target
@@ -870,4 +910,6 @@ class FFTDiffusion(nn.Module):
             ma_kernel_size=cfg.ma_kernel_size,
             block_diffusion_mode=getattr(cfg, "block_diffusion_mode", "full"),
             block_size=getattr(cfg, "block_size", None),
+            bernoulli_sampling=getattr(cfg, "bernoulli_sampling", False),
+            bernoulli_p=getattr(cfg, "bernoulli_p", 0.7),
         )

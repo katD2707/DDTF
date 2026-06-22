@@ -132,6 +132,11 @@ def parse_args():
     parser.add_argument("--block_diffusion_mode", type=str, default=None,
                         choices=["full", "fixed"])
     parser.add_argument("--block_size", type=int, default=None)
+    # Bernoulli timestep sampling
+    parser.add_argument("--bernoulli_sampling", action="store_true", default=None,
+                        help="Enable Bernoulli-gated non-uniform timestep sampling")
+    parser.add_argument("--bernoulli_p", type=float, default=None,
+                        help="Bernoulli probability for high-noise interval (default: 0.7)")
 
     # Training overrides
     parser.add_argument("--learning_rate", type=float, default=None)
@@ -354,6 +359,9 @@ def main():
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
+                # Feed t_delta for Bernoulli timestep sampling
+                if stop_step is not None:
+                    model._t_delta = int(stop_step)
 
             metrics = evaluate(model, val_loader, device, revin=revin,
                                num_samples=tcfg.num_samples, stop_step=stop_step,
@@ -425,6 +433,9 @@ def main():
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")
+        # Feed t_delta for Bernoulli timestep sampling (test-time calibration)
+        if stop_step is not None:
+            model._t_delta = int(stop_step)
 
     test_metrics = evaluate(model, test_loader, device, revin=revin,
                             num_samples=tcfg.num_samples, stop_step=stop_step,

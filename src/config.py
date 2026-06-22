@@ -125,6 +125,14 @@ class ModelConfig:
     block_diffusion_mode: Literal["full", "fixed"] = "full"
     block_size: Optional[int] = None       # required when block_diffusion_mode="fixed"
 
+    # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
+    # When enabled, training timesteps are sampled non-uniformly via a
+    # Bernoulli gate: with prob p sample from [t_delta, T-1] (high-noise),
+    # with prob 1-p sample from [1, t_delta] (low-noise).
+    # t_delta is derived dynamically from the early-stopping stop_step.
+    bernoulli_sampling: bool = False
+    bernoulli_p: float = 0.7
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Training
 # ═════════════════════════════════════════════════════════════════════════════
