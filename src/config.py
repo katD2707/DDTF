@@ -142,6 +142,7 @@ class TrainingConfig:
     learning_rate: float = 5e-4
     weight_decay: float = 0.01
     batch_size: int = 64
+    test_batch_size: int = 1
     num_epochs: int = 50
     gradient_clip: float = 1.0
 

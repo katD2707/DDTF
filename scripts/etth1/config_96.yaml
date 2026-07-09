@@ -14,7 +14,7 @@ model:
   patch_size: 24
 
   # RevIN (instance normalization for distribution shift)
-  use_revin: false
+  use_revin: true
   revin_affine: false
   use_de_stationary: true
 
@@ -26,7 +26,7 @@ model:
 
   n_heads: 4
   mlp_ratio: 4
-  dropout: 0.2
+  dropout: 0.4
 
   # Diffusion
   num_diffusion_steps: 1000
@@ -34,7 +34,7 @@ model:
   num_fft_stages: 0
   stage_schedule: linear    # linear | cosine | quadratic | sqrt
   topk_schedule: linear     # linear | cosine | quadratic | sqrt
-  noise_schedule: exp    # linear | cosine | quad | sigmoid
+  noise_schedule: linear    # linear | cosine | quad | sigmoid
   beta_start: 0.0001
   beta_end: 0.1
   eta: 1.0                  # DDIM eta; 0 = deterministic
@@ -49,14 +49,15 @@ model:
   block_diffusion_mode: full   # full | fixed
   block_size: 96             # int; required when block_diffusion_mode=fixed, default=patch_size
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
-  bernoulli_sampling: false
-  bernoulli_p: 0.7
+  bernoulli_sampling: true
+  bernoulli_p: 0.9
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   learning_rate: 0.0005
   weight_decay: 0.01
   batch_size: 64
+  test_batch_size: 64
   num_epochs: 30
   gradient_clip: 1.0
 
@@ -86,7 +87,7 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-exp-l1_etth1_early_96
+  checkpoint_dir: checkpoints/normal-norev-l1_etth1_early_ber0.9_96
   seed: 42
   device: auto              # auto | cpu | cuda
 

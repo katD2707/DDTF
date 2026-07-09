@@ -139,7 +139,10 @@ def load_csv_dataset(
             ``StandardScaler`` fitting.  Validation and test splits are
             never perturbed.
     """
-    df = pd.read_csv(csv_path)
+    if "exchange" in csv_path:        
+        df = pd.read_csv(csv_path, header=None)
+    else:
+        df = pd.read_csv(csv_path)
     if "date" in df.columns:
         df = df.drop(columns=["date"])
     if target_col is not None:
@@ -162,8 +165,8 @@ def load_csv_dataset(
     splits = {k: (min(s, n), min(e, n)) for k, (s, e) in splits.items()}
 
     train_data = data[splits["train"][0] : splits["train"][1]]
-    val_data   = data[splits["val"][0]   : splits["val"][1]]
-    test_data  = data[splits["test"][0]  : splits["test"][1]]
+    val_data   = data[splits["val"][0] - context_length  : splits["val"][1]]
+    test_data  = data[splits["test"][0] - context_length : splits["test"][1]]
 
     # ── Apply training-only data perturbation (SEER Appendix B) ──────────
     if (

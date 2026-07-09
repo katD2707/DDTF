@@ -18,10 +18,10 @@ model:
   revin_affine: false
   use_de_stationary: true
 
-  d_model_encoder: 512
-  n_encoder_layers: 2
+  d_model_encoder: 128
+  n_encoder_layers: 3
 
-  d_model_denoiser: 256
+  d_model_denoiser: 128
   n_denoiser_layers: 3
 
   n_heads: 4
@@ -46,17 +46,18 @@ model:
   # Block diffusion (BD3LM-style causal block training and semi-AR inference)
   #   full   → original; block_size = prediction_length (no causal structure added)
   #   fixed  → fixed block_size; must divide prediction_length and patch_size
-  block_diffusion_mode: fixed   # full | fixed
+  block_diffusion_mode: full   # full | fixed
   block_size: 96             # int; required when block_diffusion_mode=fixed, default=patch_size
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
-  bernoulli_sampling: false
-  bernoulli_p: 0.7
+  bernoulli_sampling: true
+  bernoulli_p: 0.9
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   learning_rate: 0.0005
   weight_decay: 0.01
   batch_size: 64
+  test_batch_size: 128
   num_epochs: 30
   gradient_clip: 1.0
 
@@ -86,7 +87,7 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-e2mlp512-d3h256-p0.4-l1_ettm2_early_96
+  checkpoint_dir: checkpoints/normal-e3h128-d3h128-p0.4-l1_ettm2_early_ber0.9_96
   seed: 42
   device: auto              # auto | cpu | cuda
 

@@ -32,7 +32,7 @@ from src.dataset import load_csv_dataset
 from src.diffusion import FFTDiffusion
 from src.metrics import compute_metrics, MetricTracker
 from src.revin import RevIN
-
+from src.early_stopping import find_global_early_stop
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -142,6 +142,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--test_batch_size", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
     parser.add_argument("--gradient_clip", type=float, default=None)
     parser.add_argument("--lr_scheduler", type=str, default=None,
@@ -213,9 +214,9 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=tcfg.batch_size, shuffle=True,
                               num_workers=tcfg.num_workers, pin_memory=tcfg.pin_memory,
                               drop_last=True)
-    val_loader = DataLoader(test_ds, batch_size=tcfg.batch_size, shuffle=False,
+    val_loader = DataLoader(test_ds, batch_size=tcfg.test_batch_size, shuffle=False,
                             num_workers=tcfg.num_workers, pin_memory=tcfg.pin_memory)
-    test_loader = DataLoader(test_ds, batch_size=tcfg.batch_size, shuffle=False,
+    test_loader = DataLoader(test_ds, batch_size=tcfg.test_batch_size, shuffle=False,
                              num_workers=tcfg.num_workers, pin_memory=tcfg.pin_memory)
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -347,15 +348,26 @@ def main():
         if epoch % tcfg.eval_interval == 0:
             stop_step = None
             if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
-                pilot_ctx, _ = next(iter(val_loader))
-                pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
-                tau, delta = None, None
-                if revin is not None:
-                    pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
-                es_result = model.find_optimal_stop_step(
-                    pilot_ctx, num_samples=tcfg.num_samples,
+                pilot_eval_count = 0
+                all_scores = []
+                test_dtl = iter(val_loader)
+                while pilot_eval_count < tcfg.num_pilot_samples:
+                    pilot_ctx, _ = next(test_dtl)
+                    pilot_ctx = pilot_ctx[:min(tcfg.test_batch_size, tcfg.num_pilot_samples-pilot_eval_count)].to(device)
+                    tau, delta = None, None
+                    if revin is not None:
+                        pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+                    _, scores, steps = model.sample(
+                        pilot_ctx, num_samples=tcfg.num_samples, return_scores=True, tau=tau, delta=delta,
+                    )
+                    pilot_eval_count += tcfg.test_batch_size
+                    all_scores.append(scores)
+                all_scores = torch.cat(all_scores, dim=0)
+                es_result = find_global_early_stop(
+                    scores=all_scores, steps=steps,
+                    smooth_window=None,
+                    min_frac=0.1,
                     safety_margin=tcfg.early_stop_safety_margin,
-                    tau=tau, delta=delta,
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
@@ -422,14 +434,26 @@ def main():
 
     stop_step = None
     if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
-        pilot_ctx, _ = next(iter(val_loader))
-        pilot_ctx = pilot_ctx[:tcfg.num_pilot_samples].to(device)
-        if revin is not None:
-            pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
-        es_result = model.find_optimal_stop_step(
-            pilot_ctx, num_samples=tcfg.num_samples,
+        pilot_eval_count = 0
+        all_scores = []
+        test_dtl = iter(val_loader)
+        while pilot_eval_count < tcfg.num_pilot_samples:
+            pilot_ctx, _ = next(test_dtl)
+            pilot_ctx = pilot_ctx[:min(tcfg.test_batch_size, tcfg.num_pilot_samples-pilot_eval_count)].to(device)
+            tau, delta = None, None
+            if revin is not None:
+                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+            _, scores, steps = model.sample(
+                pilot_ctx, num_samples=tcfg.num_samples, return_scores=True, tau=tau, delta=delta,
+            )
+            pilot_eval_count += tcfg.test_batch_size
+            all_scores.append(scores)
+        all_scores = torch.cat(all_scores, dim=0)
+        es_result = find_global_early_stop(
+            scores=all_scores, steps=steps,
+            smooth_window=None,
+            min_frac=0.1,
             safety_margin=tcfg.early_stop_safety_margin,
-            tau=tau, delta=delta,
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")

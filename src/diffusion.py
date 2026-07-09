@@ -12,7 +12,7 @@ import math
 from typing import Optional, Tuple
 import random
 from functools import partial
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -638,7 +638,7 @@ class FFTDiffusion(nn.Module):
 
         all_scores: list = []
         all_steps: list = []
-
+        all_cand_scores = []
         for t_now, t_next in pairs:
             t_b = torch.full((B_eff,), t_now, device=device, dtype=torch.long)
             t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
@@ -650,6 +650,7 @@ class FFTDiffusion(nn.Module):
 
             if return_scores:
                 c_avg = rearrange(candidate, "(b n) l c -> b n l c", n=num_samples).mean(1)
+                all_cand_scores.append(rearrange(candidate, "(b n) l c -> b n l c", n=num_samples))
                 all_scores.append(c_avg.mean(dim=(-2, -1)))
                 all_steps.append(t_now)
 
@@ -848,39 +849,6 @@ class FFTDiffusion(nn.Module):
             steps_t = torch.tensor(steps_recorded, dtype=torch.float, device=y_gen.device)
             return y_gen, scores, steps_t
         return y_gen
-
-    @torch.no_grad()
-    def find_optimal_stop_step(
-        self,
-        pilot_contexts: Tensor,
-        num_samples: int = 1,
-        smooth_window: Optional[int] = None,
-        min_frac: float = 0.1,
-        safety_margin: int = 0,
-        tau: Optional[Tensor] = None,
-        delta: Optional[Tensor] = None,
-    ) -> dict:
-        """
-        Run pilot samples through full diffusion to find the optimal
-        global stopping step via piecewise-linear breakpoint detection.
-
-        Note: in block-diffusion mode (block_size < prediction_length)
-        ``return_scores`` is not supported; the method falls back to full
-        sampling and returns an empty dict (early stopping disabled).
-        """
-        if self.block_diffusion_mode != "full":
-            # Early stopping not yet supported for block mode
-            return {"stop_step": None}
-
-        _, scores, steps = self.sample(
-            pilot_contexts, num_samples=num_samples, return_scores=True, tau=tau, delta=delta,
-        )
-        return find_global_early_stop(
-            scores=scores, steps=steps,
-            smooth_window=smooth_window,
-            min_frac=min_frac,
-            safety_margin=safety_margin,
-        )
 
     # ── Factory ───────────────────────────────────────────────────────────
 

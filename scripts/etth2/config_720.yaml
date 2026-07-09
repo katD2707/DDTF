@@ -14,7 +14,7 @@ model:
   patch_size: 24
 
   # RevIN (instance normalization for distribution shift)
-  use_revin: false
+  use_revin: true
   revin_affine: false
   use_de_stationary: true
 
@@ -46,17 +46,18 @@ model:
   # Block diffusion (BD3LM-style causal block training and semi-AR inference)
   #   full   → original; block_size = prediction_length (no causal structure added)
   #   fixed  → fixed block_size; must divide prediction_length and patch_size
-  block_diffusion_mode: fixed   # full | fixed
+  block_diffusion_mode: full   # full | fixed
   block_size: 720             # int; required when block_diffusion_mode=fixed, default=patch_size
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
-  bernoulli_sampling: false
-  bernoulli_p: 0.7
+  bernoulli_sampling: true
+  bernoulli_p: 0.9
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   learning_rate: 0.0005
   weight_decay: 0.01
   batch_size: 64
+  test_batch_size: 128
   num_epochs: 30
   gradient_clip: 1.0
 
@@ -68,7 +69,7 @@ training:
   amp_dtype: float16         # float16 or bfloat16
 
   # Training early stopping (patience-based on val MSE)
-  patience: 3                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
+  patience: 5                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
 
   # Resume from checkpoint
   resume: ""                 # path to epoch_N.pt checkpoint, empty = start fresh
@@ -86,7 +87,7 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-revin-nh4-e2h128-d4h256-p0.5-l1_etth2_early_720
+  checkpoint_dir: checkpoints/normal-e2h128-d4h256-p0.5-l1_etth2_early_ber0.9_720
   seed: 42
   device: auto              # auto | cpu | cuda
 # ── Data Perturbation (SEER Appendix B, Algorithms 1–4) ──────────────────────

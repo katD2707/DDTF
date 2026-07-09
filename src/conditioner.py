@@ -35,7 +35,7 @@ class ConditionBlock(nn.Module):
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         scale = self.head_dim ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = torch.einsum("...ld,...sd->...ls", q, k) * scale
 
         # apply de-stationary modulation if provided
         tau = 1.0 if tau is None else tau.view(B, 1, 1, 1)  # [B, 1, 1, 1]
