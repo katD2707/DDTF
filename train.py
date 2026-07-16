@@ -205,7 +205,6 @@ def main():
         prediction_length=mcfg.prediction_length,
         eval_prediction_length=tcfg.eval_prediction_length,
         target_col=dcfg.target_col,
-        perturbation_cfg=cfg.perturbation,
     )
     mcfg.num_features = train_ds.num_channels
     print(f"Data: {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test  "
