@@ -87,7 +87,7 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-norev-l1_etth1_early_ber0.9_96
+  checkpoint_dir: checkpoints/normal-l1_etth1_early_ber0.9_96
   seed: 42
   device: auto              # auto | cpu | cuda
 

@@ -235,7 +235,6 @@ class DiTDenoiser(nn.Module):
             for _ in range(n_layers)
         ])
         self.final_layer = FinalLayer(d_model, patch_size)
-        self.delta_head  = FinalLayer(d_model, patch_size)
 
         self._init_weights()
 
@@ -304,7 +303,7 @@ class DiTDenoiser(nn.Module):
                 nn.init.xavier_uniform_(block.sa_qkv_proj.weight)
                 nn.init.zeros_(block.sa_out_proj.weight)
                 nn.init.zeros_(block.sa_out_proj.bias)
-        for head in [self.final_layer, self.delta_head]:
+        for head in [self.final_layer]:
             nn.init.zeros_(head.adaLN[-1].weight)
             nn.init.zeros_(head.adaLN[-1].bias)
             nn.init.zeros_(head.linear.weight)
@@ -375,8 +374,6 @@ class DiTDenoiser(nn.Module):
             h = block(h, c, cond_emb, attn_mask=attn_mask, tau=tau, delta=delta)
 
         y0_out = self.final_layer(h, c).flatten(-2)
-        delta_out = self.delta_head(h, c).flatten(-2)
 
         y0_out = rearrange(y0_out, "(b c) l -> b l c", b=B, c=C)
-        delta_out = rearrange(delta_out, "(b c) l -> b l c", b=B, c=C)
-        return y0_out, delta_out
+        return y0_out

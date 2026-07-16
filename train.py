@@ -69,12 +69,14 @@ def evaluate(
         tau, delta = None, None
         if revin is not None:
             ctx, tau, delta = revin(ctx, mode="norm")
+            norm_tgt, _, _ = revin(tgt, mode="norm", reuse_stats=True)
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
                              eval_prediction_length=eval_length,
                              use_early_stop=use_early_stop,
                              early_stop_safety_margin=early_stop_safety_margin,
                              tau=tau, delta=delta)
+        # np.savez('target', norm_tgt.detach().cpu().numpy())
 
         if revin is not None:
             pred = revin(pred, mode="denorm")
