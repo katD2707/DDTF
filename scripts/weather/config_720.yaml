@@ -1,0 +1,118 @@
+# FFT-Diff configuration file
+# Usage: python train.py --config config.yaml
+# CLI args still override values set here (e.g. --batch_size 32).
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  csv: /cm/archive/datnc13/data/timeseries/weather.csv
+  target_col: null          # null = multivariate; set to a column name for univariate
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  context_length: 192
+  prediction_length: 720
+  patch_size: 24
+
+  # RevIN (instance normalization for distribution shift)
+  use_revin: false
+  revin_affine: false
+  use_de_stationary: true
+
+  d_model_encoder: 128
+  n_encoder_layers: 3
+
+  d_model_denoiser: 128
+  n_denoiser_layers: 4
+
+  n_heads: 4
+  mlp_ratio: 4
+  dropout: 0.2
+
+  # Diffusion
+  num_diffusion_steps: 1000
+  num_sampling_steps: 20
+  num_fft_stages: 0
+  stage_schedule: linear    # linear | cosine | quadratic | sqrt
+  topk_schedule: linear     # linear | cosine | quadratic | sqrt
+  noise_schedule: linear    # linear | cosine | quad | sigmoid
+  beta_start: 0.0001
+  beta_end: 0.1
+  eta: 1.0                  # DDIM eta; 0 = deterministic
+
+  # Staged transform: "fft" (frequency filtering) or "ma" (repeated moving average)
+  transform_type: ma
+  ma_kernel_size: 3           # box-kernel width (only used when transform_type=ma)
+
+  # Block diffusion (BD3LM-style causal block training and semi-AR inference)
+  #   full   → original; block_size = prediction_length (no causal structure added)
+  #   fixed  → fixed block_size; must divide prediction_length and patch_size
+  block_diffusion_mode: full   # full | fixed
+  block_size: 720             # int; required when block_diffusion_mode=fixed, default=patch_size
+  # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
+  bernoulli_sampling: true
+  bernoulli_p: 0.9
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  learning_rate: 0.0005
+  weight_decay: 0.01
+  batch_size: 64
+  test_batch_size: 128
+  num_epochs: 30
+  gradient_clip: 1.0
+
+  lr_scheduler: cosine      # cosine | step | none
+  warmup_epochs: 0
+
+  # AMP (automatic mixed precision)
+  use_amp: false
+  amp_dtype: float16         # float16 or bfloat16
+
+  # Training early stopping (patience-based on val MSE)
+  patience: 10                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
+
+  # Resume from checkpoint
+  resume: ""                 # path to epoch_N.pt checkpoint, empty = start fresh
+
+  # Early stopping (inference)
+  use_early_stop: true
+  num_pilot_samples: 128
+  early_stop_safety_margin: 0
+
+  # Sampling
+  num_samples: 30              # ensemble size for evaluation
+  eval_prediction_length: 720
+
+  # Logging & checkpointing
+  num_workers: 2
+  eval_interval: 1
+  save_interval: 10
+  checkpoint_dir: checkpoints/normal-e3h128-d4h128-p0.2-l1_weather_early_ber0.9_720
+  seed: 42
+  device: auto              # auto | cpu | cuda
+# ── Data Perturbation (SEER Appendix B, Algorithms 1–4) ──────────────────────
+# Applied to the training split ONLY, before scaling and windowing.
+# Set `enabled: true` and list one or more types to activate augmentation.
+# Valid types: white_noise | anomalies | missing_values | distribution_shift
+perturbation:
+  enabled: false
+  types: [white_noise,anomalies,missing_values,distribution_shift]          # e.g. [white_noise, anomalies]
+  seed: 2026         # integer for reproducibility, null = random
+
+  # Algorithm 1 – White Noise (Appendix B.1)
+  noise_ratio: 0.05  # fraction of time points to corrupt
+  noise_scale: 1.0   # noise std = noise_scale × channel std
+
+  # Algorithm 2 – Anomalies (Appendix B.2)
+  cont_anomaly_ratio: 0.05  # fraction of time covered by contiguous segments
+  cont_segment_len: 12       # length of each anomaly segment
+  outlier_ratio: 0.005       # fraction of point outliers (0.5%)
+  anomaly_scale: 2.0         # magnitude = anomaly_scale × channel std
+
+  # Algorithm 3 – Missing Values (Appendix B.3)
+  missing_ratio: 0.05       # fraction of time to zero out
+  missing_segment_len: 12    # length of each missing segment
+
+  # Algorithm 4 – Distribution Shift (Appendix B.4)
+  num_shift_segments: 5      # number of segments (K_shift)
+  shift_scale: 5.0           # offset magnitude = shift_scale × channel std
