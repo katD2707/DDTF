@@ -301,9 +301,6 @@ class FFTDiffusion(nn.Module):
         eta: float = 1.0,
         transform_type: str = "fft",
         ma_kernel_size: int = 3,
-        # Block diffusion
-        block_diffusion_mode: str = "full",
-        block_size: Optional[int] = None,
         # Bernoulli timestep sampling
         bernoulli_sampling: bool = False,
         bernoulli_p: float = 0.7,
@@ -318,23 +315,9 @@ class FFTDiffusion(nn.Module):
         self.patch_size = patch_size
         self.transform_type = transform_type
         self._topk_schedule = topk_schedule
-        self.causal = block_diffusion_mode != "full"
         self.bernoulli_sampling = bernoulli_sampling
         self.bernoulli_p = bernoulli_p
         self._t_delta: Optional[int] = None  # set dynamically from stop_step
-
-        # ── Block diffusion configuration ───────────────────────────────────
-        assert block_diffusion_mode in ("full", "fixed"), (
-            f"Unknown block_diffusion_mode: {block_diffusion_mode}")
-        self.block_diffusion_mode = block_diffusion_mode
-        self._fixed_block_size = block_size or patch_size
-
-        if block_diffusion_mode == "fixed":
-            assert max_prediction_length % self._fixed_block_size == 0, (
-                f"max_prediction_length ({max_prediction_length}) must be divisible by block_size ({self._fixed_block_size})")
-            # assert self._fixed_block_size % patch_size == 0, (
-            #     f"block_size ({self._fixed_block_size}) must be divisible by patch_size ({patch_size})")
-        self.block_size = self._get_block_size()
 
         # Sub-modules
         self.condition_encoder = ConditionEncoder(
@@ -349,8 +332,6 @@ class FFTDiffusion(nn.Module):
             n_heads=n_heads,
             mlp_ratio=mlp_ratio,
             dropout=dropout,
-            use_causal_block_attn=self.causal,
-            block_size=self.block_size if self.causal else None,
         )
 
         # ── Staged transform ──────────────────────────────────────────────────
@@ -358,7 +339,7 @@ class FFTDiffusion(nn.Module):
             self.staged_transform = StagedMA(K=num_fft_stages, kernel_size=ma_kernel_size)
         else:
             self.staged_transform = StagedFFT(
-                K=num_fft_stages, seq_len=self.block_size, schedule=topk_schedule)
+                K=num_fft_stages, seq_len=max_prediction_length, schedule=topk_schedule)
 
         boundaries = make_stage_schedule(num_fft_stages, num_diffusion_steps, stage_schedule)
         self.register_buffer("stage_boundaries", boundaries)
@@ -390,15 +371,7 @@ class FFTDiffusion(nn.Module):
         reg("post_coef1", betas * ac_prev.sqrt() / (1 - ac))
         reg("post_coef2", (1 - ac_prev) * alphas.sqrt() / (1 - ac))
 
-    # ── Block diffusion helpers ───────────────────────────────────────────
-
-    def _get_block_size(self) -> int:
-        """Return the block size for the current batch."""
-        # "full"  → seq_len = prediction_length  (original)
-        # "fixed" → seq_len = block_size         (per-block transforms)
-        if self.block_diffusion_mode == "fixed":
-            return self._fixed_block_size
-        return self.max_prediction_length
+    # ── Bernoulli timestep sampling ──────────────────────────────────────────
 
     def _sample_timestep_bernoulli(self, batch_size: int, device) -> Tensor:
         """Bernoulli-gated non-uniform timestep sampling (flipped ranges).
@@ -426,7 +399,7 @@ class FFTDiffusion(nn.Module):
 
     def q_sample(self, y0: Tensor, t: Tensor, noise: Optional[Tensor] = None) -> Tensor:
         """
-        q_sample with per-position (per-block) diffusion timestep.
+        Forward diffusion: add noise to the clean signal.
 
         Args:
             y0:    [B, L, C]   clean (degraded) signal
@@ -468,15 +441,7 @@ class FFTDiffusion(nn.Module):
 
     def forward(self, y: Tensor, context: Tensor, tau: Optional[Tensor] = None, delta: Optional[Tensor] = None):
         """
-        Training step — block-diffusion aware.
-
-        In "full" mode this is identical to the original single-block behaviour.
-        In "fixed" mode the prediction sequence is split into
-        ``num_blocks`` blocks; each block gets an independently sampled
-        diffusion timestep.  With 50 % probability the KV source for the
-        causal self-attention is the *noisy* y_t (noised-prev training);
-        with 50 % probability it is the clean FFT-degraded y_target
-        (unnoised-prev training, corresponding to BD3LM's unmasked conditioning).
+        Training step.
         """
         B, _, C = y.shape
         device = y.device
@@ -485,45 +450,19 @@ class FFTDiffusion(nn.Module):
 
         # ── Timestep sampling ───────────────────────
         _use_bernoulli = (self.bernoulli_sampling and self._t_delta is not None)
-
-        if self.causal:
-            num_blocks = self.max_prediction_length // self.block_size
-            if _use_bernoulli:
-                # Sample each block's timestep via Bernoulli gating
-                t_per_block = self._sample_timestep_bernoulli(
-                    B * num_blocks, device).reshape(B, num_blocks)
-            else:
-                t_per_block = torch.randint(
-                    0, self.num_diffusion_steps, (B, num_blocks), device=device)
-            t = t_per_block.repeat_interleave(self.block_size, dim=1)  # [B, pred_len]
-            
-            y_flat = y.reshape(B * num_blocks, self.block_size, C)
-            t_flat = t_per_block.reshape(B * num_blocks)
-            y_target_flat, y_k_flat = self._compute_xt(y_flat, t_flat)
-            
-            y_target = y_target_flat.reshape(B, self.max_prediction_length, C)
-            y_k      = y_k_flat.reshape(B, self.max_prediction_length, C)
+        if _use_bernoulli:
+            t_scalar = self._sample_timestep_bernoulli(B, device)
         else:
-            if _use_bernoulli:
-                t_scalar = self._sample_timestep_bernoulli(B, device)
-            else:
-                t_scalar = torch.randint(
-                    0, self.num_diffusion_steps, (B,), device=device)
-            y_target, y_k = self._compute_xt(y, t_scalar)
-            t = t_scalar.unsqueeze(1).expand(B, self.max_prediction_length)
+            t_scalar = torch.randint(
+                0, self.num_diffusion_steps, (B,), device=device)
+        y_target, y_k = self._compute_xt(y, t_scalar)
+        t = t_scalar.unsqueeze(1).expand(B, self.max_prediction_length)
         delta_target = y_k - y_target
 
         # ── Add Gaussian noise ────────────────────────────────────────────
         y_t = self.q_sample(y_target, t)
-        if self.causal:
-            y_kv = y
-            t_kv = torch.full_like(t, self.num_diffusion_steps)
-
-            y_input = torch.cat([y_t, y_kv], dim=1)   # [B, 2L, C]
-            t_input = torch.cat([t, t_kv], dim=1)      # [B, 2L]
-        else:
-            y_input = y_t
-            t_input = t
+        y_input = y_t
+        t_input = t
 
         # ── Main denoiser forward ─────────────────────────────────────────
         # loss_fn = F.mse_loss
@@ -556,36 +495,20 @@ class FFTDiffusion(nn.Module):
         num_samples: int = 1,
         stop_step: Optional[int] = None,
         return_scores: bool = False,
-        use_early_stop: bool = False,
-        early_stop_safety_margin: int = 0,
         tau: Optional[Tensor] = None,
         delta: Optional[Tensor] = None,
     ):
         """
-        Generate forecasts.
-
-        In **full** mode: original single-block DDIM sampling (unchanged).
-        In **block** mode: semi-AR block sampling (BD3LM-style).
-          - The full prediction sequence is initialised as pure Gaussian noise.
-          - Blocks are denoised left-to-right.
-          - Each block runs ``num_sampling_steps`` reverse diffusion steps.
-          - Previously generated (clean) blocks remain frozen and serve as
-            causal conditioning for the current block via the block-causal
-            self-attention.
+        Generate forecasts using DDIM sampling.
 
         Args:
             context:                [B, ctx_len, C]
             eval_prediction_length: forecast horizon to generate; must be
                                     ≤ max_prediction_length (training length).
-                                    In block mode must be divisible by block_size.
                                     Defaults to the training prediction_length.
             num_samples:            ensemble size
             stop_step:              if set, stop full-mode sampling at this t
             return_scores:          if True, return (pred, scores, steps)
-            use_early_stop:         block mode only — each block independently
-                                    detects its own optimal stop step inline;
-                                    requires num_samples > 1.
-            early_stop_safety_margin: steps before detected breakpoint to stop.
         Returns:
             predictions [B, eval_len, C]  (or tuple when return_scores=True)
         """
@@ -605,21 +528,6 @@ class FFTDiffusion(nn.Module):
             delta = repeat(delta, "b l c -> (b n) l c", n=num_samples) if delta is not None else None
 
         B_eff = B_orig * num_samples
-
-        if not self.causal:
-            return self._sample_full(
-                cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores, tau, delta)
-
-        return self._sample_block_semi_ar(
-            cond, B_eff, C, device, eval_len, num_samples,
-            return_scores=return_scores,
-            use_early_stop=use_early_stop,
-            early_stop_safety_margin=early_stop_safety_margin,
-            tau=tau, delta=delta,
-        )
-
-    def _sample_full(self, cond, B_eff, C, device, eval_len, num_samples, stop_step, return_scores, tau, delta):
-        """Full-sequence DDIM sampling; eval_len may be < max_prediction_length."""
         y_t = torch.randn(B_eff, eval_len, C, device=device)
 
         times = select_sampling_timesteps(self.stage_boundaries, self.num_diffusion_steps, self.num_sampling_steps)
@@ -691,8 +599,6 @@ class FFTDiffusion(nn.Module):
             eta=cfg.eta,
             transform_type=cfg.transform_type,
             ma_kernel_size=cfg.ma_kernel_size,
-            block_diffusion_mode=getattr(cfg, "block_diffusion_mode", "full"),
-            block_size=getattr(cfg, "block_size", None),
             bernoulli_sampling=getattr(cfg, "bernoulli_sampling", False),
             bernoulli_p=getattr(cfg, "bernoulli_p", 0.7),
         )

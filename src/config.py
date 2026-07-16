@@ -80,12 +80,6 @@ class ModelConfig:
     transform_type: Literal["fft", "ma"] = "fft"
     ma_kernel_size: int = 3  # box-kernel width for MA transform
 
-    # Block diffusion (BD3LM-style causal block training/inference)
-    # "full"  → block_size = prediction_length (original, no causal structure)
-    # "fixed" → user-specified block_size (must divide prediction_length and patch_size)
-    block_diffusion_mode: Literal["full", "fixed"] = "full"
-    block_size: Optional[int] = None       # required when block_diffusion_mode="fixed"
-
     # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
     # When enabled, training timesteps are sampled non-uniformly via a
     # Bernoulli gate: with prob p sample from [t_delta, T-1] (high-noise),

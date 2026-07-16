@@ -53,8 +53,7 @@ def evaluate(
     num_samples: int = 1,
     stop_step: Optional[int] = None,
     eval_length: Optional[int] = None,
-    use_early_stop: bool = False,
-    early_stop_safety_margin: int = 0,
+
 ) -> dict:
     """
     Evaluate model on a dataloader.  When RevIN is provided the context
@@ -73,8 +72,6 @@ def evaluate(
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
                              eval_prediction_length=eval_length,
-                             use_early_stop=use_early_stop,
-                             early_stop_safety_margin=early_stop_safety_margin,
                              tau=tau, delta=delta)
         # np.savez('target', norm_tgt.detach().cpu().numpy())
 
@@ -130,10 +127,7 @@ def parse_args():
     parser.add_argument("--transform_type", type=str, default=None,
                         choices=["fft", "ma"])
     parser.add_argument("--ma_kernel_size", type=int, default=None)
-    # Block diffusion
-    parser.add_argument("--block_diffusion_mode", type=str, default=None,
-                        choices=["full", "fixed"])
-    parser.add_argument("--block_size", type=int, default=None)
+
     # Bernoulli timestep sampling
     parser.add_argument("--bernoulli_sampling", action="store_true", default=None,
                         help="Enable Bernoulli-gated non-uniform timestep sampling")
@@ -348,7 +342,7 @@ def main():
         # ── Validation ────────────────────────────────────────────────────
         if epoch % tcfg.eval_interval == 0:
             stop_step = None
-            if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
+            if tcfg.use_early_stop:
                 pilot_eval_count = 0
                 all_scores = []
                 test_dtl = iter(val_loader)
@@ -378,9 +372,7 @@ def main():
 
             metrics = evaluate(model, val_loader, device, revin=revin,
                                num_samples=tcfg.num_samples, stop_step=stop_step,
-                               eval_length=tcfg.eval_prediction_length,
-                               use_early_stop=tcfg.use_early_stop,
-                               early_stop_safety_margin=tcfg.early_stop_safety_margin)
+                               eval_length=tcfg.eval_prediction_length)
             print(f"  ↳ Val  MSE={metrics['mse']:.4f}  MAE={metrics['mae']:.4f}  RMSE={metrics['rmse']:.4f}")
 
             if metrics["mse"] < best_val_mse:
@@ -434,7 +426,7 @@ def main():
         print("Loaded best checkpoint for testing")
 
     stop_step = None
-    if tcfg.use_early_stop and mcfg.block_diffusion_mode == "full":
+    if tcfg.use_early_stop:
         pilot_eval_count = 0
         all_scores = []
         test_dtl = iter(val_loader)
@@ -464,9 +456,7 @@ def main():
 
     test_metrics = evaluate(model, test_loader, device, revin=revin,
                             num_samples=tcfg.num_samples, stop_step=stop_step,
-                            eval_length=tcfg.eval_prediction_length,
-                            use_early_stop=tcfg.use_early_stop,
-                            early_stop_safety_margin=tcfg.early_stop_safety_margin)
+                            eval_length=tcfg.eval_prediction_length)
     print(f"\nTest  MSE={test_metrics['mse']:.4f}  MAE={test_metrics['mae']:.4f}  "
           f"RMSE={test_metrics['rmse']:.4f}")
 

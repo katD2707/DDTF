@@ -43,11 +43,6 @@ model:
   transform_type: ma
   ma_kernel_size: 3           # box-kernel width (only used when transform_type=ma)
 
-  # Block diffusion (BD3LM-style causal block training and semi-AR inference)
-  #   full   → original; block_size = prediction_length (no causal structure added)
-  #   fixed  → fixed block_size; must divide prediction_length and patch_size
-  block_diffusion_mode: full   # full | fixed
-  block_size: 720             # int; required when block_diffusion_mode=fixed, default=patch_size
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
   bernoulli_sampling: false
   bernoulli_p: 0.7

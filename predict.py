@@ -91,8 +91,7 @@ def run_evaluation(
     revin: Optional[RevIN] = None,
     num_samples: int = 1,
     stop_step: Optional[int] = None,
-    use_early_stop: bool = False,
-    early_stop_safety_margin: int = 0,
+
 ):
     """Run evaluation, returning metrics + raw arrays."""
     model.eval()
@@ -104,9 +103,7 @@ def run_evaluation(
         if revin is not None:
             ctx = revin(ctx, mode="norm")
 
-        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                             use_early_stop=use_early_stop,
-                             early_stop_safety_margin=early_stop_safety_margin)
+        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step)
 
         if revin is not None:
             pred = revin(pred, mode="denorm")
@@ -160,7 +157,7 @@ def main():
 
     # ── Auto-stop calibration ─────────────────────────────────────────────
     stop_step = None
-    if args.use_auto_stop and args.block_diffusion_mode == "full":
+    if args.use_auto_stop:
         print("Calibrating auto-stop from pilot samples...")
         pilot_ctx, _ = next(iter(test_loader))
         pilot_ctx = pilot_ctx[:args.num_pilot_samples].to(device)
@@ -179,8 +176,6 @@ def main():
     metrics, preds, targets = run_evaluation(
         model, test_loader, device, revin=revin,
         num_samples=args.num_samples, stop_step=stop_step,
-        use_early_stop=args.use_auto_stop,
-        early_stop_safety_margin=args.auto_stop_safety_margin,
     )
     elapsed = time.time() - t0
 
