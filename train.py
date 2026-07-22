@@ -14,7 +14,7 @@ import os
 import sys
 import random
 from typing import Optional
-
+from collections import defaultdict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -62,6 +62,7 @@ def evaluate(
     """
     model.eval()
     all_preds, all_targets = [], []
+    timestep_losses = defaultdict(list)
     for ctx, tgt in loader:
         ctx, tgt = ctx.to(device), tgt.to(device)
 
@@ -69,6 +70,14 @@ def evaluate(
         if revin is not None:
             ctx, tau, delta = revin(ctx, mode="norm")
             norm_tgt, _, _ = revin(tgt, mode="norm", reuse_stats=True)
+
+        # loss_dict = model(norm_tgt, ctx, tau, delta) if revin is not None else model(norm_tgt, ctx)
+        # loss = loss_dict["total"]
+        # for loss, t in zip(
+        #     loss_dict['step_loss'].tolist(),
+        #     loss_dict['step'].tolist(),
+        # ):
+        #     timestep_losses[int(t)].append(float(loss))
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
                              eval_prediction_length=eval_length,
@@ -82,6 +91,12 @@ def evaluate(
         all_preds.append(pred.cpu())
         all_targets.append(tgt.cpu())
 
+    # timestep_losses = dict(timestep_losses)
+
+    # torch.save(
+    #     timestep_losses,
+    #     f"timestep_losses_linear_test_exchange.pt",
+    # )
     preds = torch.cat(all_preds, dim=0)
     targets = torch.cat(all_targets, dim=0)
     return compute_metrics(preds, targets)

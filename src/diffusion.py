@@ -471,6 +471,8 @@ class FFTDiffusion(nn.Module):
         
         # Losses
         denoise_loss = loss_fn(y0_pred, y_target, reduction="none")
+        denoise_loss_cp = denoise_loss.detach().mean((1,2)).cpu()
+
         fft1 = torch.fft.fft(y0_pred.transpose(1, 2), norm='forward')
         fft2 = torch.fft.fft(y_target.transpose(1, 2), norm='forward')
         fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
@@ -483,6 +485,8 @@ class FFTDiffusion(nn.Module):
 
         return {
             "total": denoise_loss,
+            "step_loss": denoise_loss_cp,
+            "step": t_scalar.cpu(),
         }
 
     # ── Inference (DDIM-style fast sampling) ──────────────────────────────
