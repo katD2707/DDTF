@@ -132,16 +132,10 @@ def parse_args():
                         help="Enable learned de-stationary projector (tau/delta)")
     parser.add_argument("--num_diffusion_steps", type=int, default=None)
     parser.add_argument("--num_sampling_steps", type=int, default=None)
-    parser.add_argument("--num_fft_stages", type=int, default=None)
-    parser.add_argument("--stage_schedule", type=str, default=None)
-    parser.add_argument("--topk_schedule", type=str, default=None)
     parser.add_argument("--noise_schedule", type=str, default=None)
     parser.add_argument("--beta_start", type=float, default=None)
     parser.add_argument("--beta_end", type=float, default=None)
     parser.add_argument("--eta", type=float, default=None)
-    parser.add_argument("--transform_type", type=str, default=None,
-                        choices=["fft", "ma"])
-    parser.add_argument("--ma_kernel_size", type=int, default=None)
 
     # Bernoulli timestep sampling
     parser.add_argument("--bernoulli_sampling", action="store_true", default=None,

@@ -1,11 +1,8 @@
 """
-Staged diffusion model for time series forecasting.
+Diffusion model for time series forecasting.
 
-Implements a staged diffusion process where the signal is progressively
-degraded via K stages (either FFT frequency filtering or repeated moving
-average smoothing), decoupled from the T diffusion timesteps.
-
-Reference: f-DM (Gu et al., 2022) — arXiv:2210.04955
+Implements a standard DDPM/DDIM diffusion process for time series,
+with optional Bernoulli-gated non-uniform timestep sampling.
 """
 
 import math
@@ -27,7 +24,7 @@ from src.utils import default, extract
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Beta / Stage Schedules
+# Beta Schedule
 # ═════════════════════════════════════════════════════════════════════════════
 
 def make_beta_schedule(schedule: str, T: int, start: float = 1e-4, end: float = 0.02) -> Tensor:
@@ -56,225 +53,17 @@ def make_beta_schedule(schedule: str, T: int, start: float = 1e-4, end: float = 
         return betas
     raise ValueError(f"Unknown schedule: {schedule}")
 
-
-def make_stage_schedule(K: int, T: int, schedule: str = "linear") -> Tensor:
-    """Compute K+1 stage boundaries in [0, T]."""
-    k = torch.arange(K + 1, dtype=torch.float32)
-    if schedule == "linear":
-        b = T * k / K
-    elif schedule == "cosine":
-        b = T * 0.5 * (1 - torch.cos(math.pi * k / K))
-    elif schedule == "quadratic":
-        b = T * (k / K) ** 2
-    elif schedule == "sqrt":
-        b = T * (k / K).sqrt()
-    else:
-        raise ValueError(f"Unknown stage schedule: {schedule}")
-    b[0], b[-1] = 0.0, float(T)
-    return b
-
-
-def select_sampling_timesteps(boundaries: Tensor, T: int, S: int) -> list:
-    """Select S+1 sampling timesteps that include all stage boundaries."""
-    T_max = T - 1
-    bnd_set = set(boundaries[1:-1].round().long().clamp(0, T_max).tolist())
-    bnd_set.discard(0)
-    bnd_set.add(T_max)
-    remaining = S + 1 - len(bnd_set)
-    if remaining > 0:
-        cands = torch.linspace(-1, T_max, remaining + len(bnd_set) + 10).round().long().tolist()
-        extras = [c for c in cands if c not in bnd_set]
-        if len(extras) > remaining:
-            idx = torch.linspace(0, len(extras) - 1, remaining).round().long().tolist()
-            extras = [extras[i] for i in idx]
-        bnd_set.update(extras)
-    times = sorted(bnd_set, reverse=True)
-    if len(times) > S + 1:
-        idx = torch.linspace(0, len(times) - 1, S + 1).round().long().tolist()
-        times = [times[i] for i in idx]
-    return times
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Staged FFT Filtering
-# ═════════════════════════════════════════════════════════════════════════════
-
-class StagedFFT(nn.Module):
-    """
-    Progressive frequency-domain filtering with K stages.
-
-    Stage 0: keep all frequencies (identity).
-    Stage K: keep only the most dominant frequencies.
-    """
-
-    def __init__(self, K: int, seq_len: int, schedule: str = "linear"):
-        super().__init__()
-        self.K = K
-        self.seq_len = seq_len
-        self.freq_dim = seq_len // 2 + 1
-        min_freq = max(1, self.freq_dim // (K + 1))
-        k = torch.arange(K + 1, dtype=torch.float32)
-
-        if schedule == "linear":
-            progress = k / K
-        elif schedule == "cosine":
-            progress = 0.5 * (1 - torch.cos(math.pi * k / K))
-        elif schedule == "quadratic":
-            progress = (k / K) ** 2
-        elif schedule == "sqrt":
-            progress = (k / K).sqrt()
-        else:
-            raise ValueError(f"Unknown topk schedule: {schedule}")
-
-        num_keep = (self.freq_dim + progress * (min_freq - self.freq_dim)).round().long()
-        num_keep[0] = self.freq_dim
-        num_keep[-1] = min_freq
-        self.register_buffer("num_keep", num_keep)
-
-    def apply_stage(self, x: Tensor, stage: Tensor) -> Tensor:
-        """
-        x: [B, L, D],  stage: [B]  →  filtered x: [B, L, D]
-        """
-        B, L, D = x.shape
-        stage = stage.clamp(0, self.K)
-        if (stage == 0).all():
-            return x
-
-        x_flat = rearrange(x, "b l v -> (b v) l")
-        stage_exp = repeat(stage, "b -> (b v)", v=D)
-
-        x_fft = torch.fft.rfft(x_flat, dim=1)
-        mag = x_fft.abs()
-        k = self.num_keep[stage_exp]
-        k_max = min(k.max().item(), self.freq_dim)
-
-        _, topk_idx = torch.topk(mag, k=k_max, dim=1, largest=True)
-        arange = torch.arange(k_max, device=x.device).unsqueeze(0)
-        valid = arange < k.unsqueeze(1)
-
-        mask = torch.zeros_like(mag, dtype=torch.bool)
-        mask = torch.scatter_reduce(mask, 1, topk_idx, valid, reduce="sum", include_self=True)
-
-        x_recon = torch.fft.irfft(x_fft * mask, n=L, dim=1)
-        return rearrange(x_recon, "(b v) l -> b l v", v=D)
-
-    def apply_incremental(self, x_k: Tensor, k: Tensor) -> Tensor:
-        """
-        Incremental transform: given x at stage k, produce x at stage k+1.
-
-        Removes the bottom (n_k - n_{k+1}) frequencies by magnitude from x_k,
-        keeping only the top n_{k+1} frequencies.
-        """
-        k_next = (k + 1).clamp(max=self.K)
-        return self.apply_stage(x_k, k_next)
-        
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Staged Moving-Average Smoothing
-# ═════════════════════════════════════════════════════════════════════════════
-
-class StagedMA(nn.Module):
-    """
-    Progressive moving-average smoothing with K stages.
-
-    Stage 0: identity (no smoothing).
-    Stage k: apply a box kernel of size `kernel_size` repeated k times,
-             equivalent to a B-spline-like smoothing filter.
-
-    All effective kernels are precomputed at init for efficient training.
-    """
-
-    def __init__(self, K: int, kernel_size: int = 3):
-        super().__init__()
-        self.K = K
-        self.kernel_size = kernel_size
-        self._precompute_kernels(K, kernel_size)
-
-    def _precompute_kernels(self, K: int, ks: int):
-        """Build the effective convolution kernel for each stage 1..K."""
-        base = torch.ones(1, 1, ks, dtype=torch.float32) / ks
-        # The incremental kernel (k → k+1) is always the base kernel,
-        # since cumulative_{k+1} = conv(cumulative_k, base).
-        self.register_buffer("_inc_kernel", base)
-        kernels = []
-        eff = base.clone()
-        for stage in range(1, K + 1):
-            if stage == 1:
-                eff = base.clone()
-            else:
-                eff = F.conv1d(eff, base.flip(-1), padding=ks - 1)
-            kernels.append(eff.clone())
-        # Store as list of buffers so they move with .to(device)
-        for i, k in enumerate(kernels):
-            self.register_buffer(f"_kernel_{i}", k)
-
-    def _get_kernel(self, stage_idx: int) -> Tensor:
-        return getattr(self, f"_kernel_{stage_idx}")
-
-    def apply_stage(self, x: Tensor, stage: Tensor) -> Tensor:
-        """
-        x: [B, L, D],  stage: [B] (int, 0..K)  →  smoothed x: [B, L, D]
-        """
-        B, L, D = x.shape
-        stage = stage.clamp(0, self.K)
-        if (stage == 0).all():
-            return x
-
-        x_flat = rearrange(x, "b l v -> (b v) l")
-        stage_exp = repeat(stage, "b -> (b v)", v=D)   # [(B*D)]
-
-        # Group by unique stage value for batched conv
-        out = torch.zeros_like(x_flat)
-        unique_stages = stage_exp.unique()
-        for s in unique_stages:
-            mask = stage_exp == s
-            s_int = s.item()
-            if s_int == 0:
-                out[mask] = x_flat[mask]
-            else:
-                kernel = self._get_kernel(s_int - 1)            # 0-indexed
-                xs = x_flat[mask].unsqueeze(1)                  # [N, 1, L]
-                pad = kernel.shape[-1] // 2
-                ys = F.conv1d(xs, kernel.to(xs.device), padding=pad)
-                out[mask] = ys.squeeze(1)[:, :L]
-
-        return rearrange(out, "(b v) l -> b l v", v=D)
-
-    def apply_incremental(self, x_k: Tensor, k: Tensor) -> Tensor:
-        """
-        Incremental transform: given x at stage k, produce x at stage k+1.
-
-        Applies a single base kernel convolution (one MA pass).
-        Since cumulative_{k+1} = conv(cumulative_k, base), convolving x_k
-        with base gives x_{k+1}.
-        """
-        B, L, D = x_k.shape
-        k_next = (k + 1).clamp(max=self.K)
-        # If already at max stage, return as-is
-        if (k_next == k).all():
-            return x_k
-
-        kernel = self._inc_kernel.to(x_k.device)  # [1, 1, ks]
-        pad = kernel.shape[-1] // 2
-        x_flat = rearrange(x_k, "b l v -> (b v) 1 l")
-        out = F.conv1d(x_flat, kernel, padding=pad)
-        out = out[:, 0, :L]
-        return rearrange(out, "(b v) l -> b l v", v=D)
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Main Model: FFTDiffusion
 # ═════════════════════════════════════════════════════════════════════════════
 
 class FFTDiffusion(nn.Module):
     """
-    Staged diffusion model for time series forecasting.
+    Diffusion model for time series forecasting.
 
     Combines:
       - ConditionEncoder  (encodes historical context)
-      - Denoiser          (DiT-style, predicts y_0 + delta_t)
-      - Staged transform  (FFT frequency filtering or MA smoothing)
+      - Denoiser          (DiT-style, predicts y_0)
       - Standard DDPM/DDIM diffusion schedule
     """
 
@@ -295,13 +84,7 @@ class FFTDiffusion(nn.Module):
         beta_start: float = 1e-4,
         beta_end: float = 0.1,
         noise_schedule: str = "linear",
-        num_fft_stages: int = 8,
-        stage_schedule: str = "linear",
-        topk_schedule: str = "linear",
         eta: float = 1.0,
-        transform_type: str = "fft",
-        ma_kernel_size: int = 3,
-        # Bernoulli timestep sampling
         bernoulli_sampling: bool = False,
         bernoulli_p: float = 0.7,
     ):
@@ -310,11 +93,8 @@ class FFTDiffusion(nn.Module):
         self.max_prediction_length = max_prediction_length
         self.num_diffusion_steps = num_diffusion_steps
         self.num_sampling_steps = num_sampling_steps
-        self.num_fft_stages = num_fft_stages
         self.eta = eta
         self.patch_size = patch_size
-        self.transform_type = transform_type
-        self._topk_schedule = topk_schedule
         self.bernoulli_sampling = bernoulli_sampling
         self.bernoulli_p = bernoulli_p
         self._t_delta: Optional[int] = None  # set dynamically from stop_step
@@ -334,17 +114,7 @@ class FFTDiffusion(nn.Module):
             dropout=dropout,
         )
 
-        # ── Staged transform ──────────────────────────────────────────────────
-        if transform_type == "ma":
-            self.staged_transform = StagedMA(K=num_fft_stages, kernel_size=ma_kernel_size)
-        else:
-            self.staged_transform = StagedFFT(
-                K=num_fft_stages, seq_len=max_prediction_length, schedule=topk_schedule)
-
-        boundaries = make_stage_schedule(num_fft_stages, num_diffusion_steps, stage_schedule)
-        self.register_buffer("stage_boundaries", boundaries)
-
-        # Standard DDPM schedule (used for the Gaussian noise component)
+        # Standard DDPM schedule
         self._setup_schedule(num_diffusion_steps, beta_start, beta_end, noise_schedule)
 
     # ── schedule helpers ──────────────────────────────────────────────────
@@ -402,7 +172,7 @@ class FFTDiffusion(nn.Module):
         Forward diffusion: add noise to the clean signal.
 
         Args:
-            y0:    [B, L, C]   clean (degraded) signal
+            y0:    [B, L, C]   clean signal
             t:     [B, L]      integer timestep per position
             noise: [B, L, C]
         Returns:
@@ -412,27 +182,6 @@ class FFTDiffusion(nn.Module):
         sqrt_ac    = self.sqrt_ac[t]     # [B, L]
         sqrt_1m_ac = self.sqrt_1m_ac[t]  # [B, L]
         return sqrt_ac.unsqueeze(-1) * y0 + sqrt_1m_ac.unsqueeze(-1) * noise
-
-    # ── Stage info ────────────────────────────────────────────────────────
-
-    def _stage_info(self, t: Tensor):
-        t_f = t.float()
-        k = torch.searchsorted(self.stage_boundaries, t_f, right=True) - 1
-        k = k.clamp(0, self.num_fft_stages - 1)
-        tau_k = self.stage_boundaries[k]
-        tau_k1 = self.stage_boundaries[(k + 1).clamp(max=self.num_fft_stages)]
-        span = (tau_k1 - tau_k).float().clamp(min=1e-6)
-        w = ((t_f - tau_k.float()) / span).clamp(0, 1)
-        return k, tau_k, tau_k1, w
-
-    def _compute_xt(self, y0: Tensor, t: Tensor):
-        """Compute interpolated transformed signal x_t and stage-k version x_k."""
-        k, _, _, w = self._stage_info(t)
-        x_k = self.staged_transform.apply_stage(y0, k)
-        x_k1 = self.staged_transform.apply_stage(y0, (k + 1).clamp(max=self.num_fft_stages))
-        w = w.view(-1, 1, 1)
-        x_t = (1 - w) * x_k + w * x_k1
-        return x_t, x_k
 
     def _noise_from_y0(self, yt, t, y0):
         return (extract(self.sqrt_recip_ac, t, yt.shape) * yt - y0) / extract(self.sqrt_recipm1_ac, t, yt.shape)
@@ -455,9 +204,8 @@ class FFTDiffusion(nn.Module):
         else:
             t_scalar = torch.randint(
                 0, self.num_diffusion_steps, (B,), device=device)
-        y_target, y_k = self._compute_xt(y, t_scalar)
+        y_target = y
         t = t_scalar.unsqueeze(1).expand(B, self.max_prediction_length)
-        delta_target = y_k - y_target
 
         # ── Add Gaussian noise ────────────────────────────────────────────
         y_t = self.q_sample(y_target, t)
@@ -465,7 +213,6 @@ class FFTDiffusion(nn.Module):
         t_input = t
 
         # ── Main denoiser forward ─────────────────────────────────────────
-        # loss_fn = F.mse_loss
         loss_fn = F.l1_loss
         y0_pred = self.denoiser(y_input, t_input, cond, tau=tau, delta=delta)
         
@@ -534,7 +281,8 @@ class FFTDiffusion(nn.Module):
         B_eff = B_orig * num_samples
         y_t = torch.randn(B_eff, eval_len, C, device=device)
 
-        times = select_sampling_timesteps(self.stage_boundaries, self.num_diffusion_steps, self.num_sampling_steps)
+        # Uniform sampling timesteps from T-1 down to -1
+        times = torch.linspace(self.num_diffusion_steps - 1, -1, self.num_sampling_steps + 1).round().long().tolist()
         pairs = list(zip(times[:-1], times[1:]))
 
         all_scores: list = []
@@ -597,12 +345,7 @@ class FFTDiffusion(nn.Module):
             beta_start=cfg.beta_start,
             beta_end=cfg.beta_end,
             noise_schedule=cfg.noise_schedule,
-            num_fft_stages=cfg.num_fft_stages,
-            stage_schedule=cfg.stage_schedule,
-            topk_schedule=cfg.topk_schedule,
             eta=cfg.eta,
-            transform_type=cfg.transform_type,
-            ma_kernel_size=cfg.ma_kernel_size,
             bernoulli_sampling=getattr(cfg, "bernoulli_sampling", False),
             bernoulli_p=getattr(cfg, "bernoulli_p", 0.7),
         )

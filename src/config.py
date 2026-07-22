@@ -71,14 +71,7 @@ class ModelConfig:
     beta_start: float = 1e-4
     beta_end: float = 0.1
     noise_schedule: Literal["linear", "cosine", "quad", "sigmoid", "exp"] = "linear"
-    num_fft_stages: int = 8
-    stage_schedule: Literal["linear", "cosine", "quadratic", "sqrt"] = "linear"
-    topk_schedule: Literal["linear", "cosine", "quadratic", "sqrt"] = "linear"
     eta: float = 1.0  # DDIM eta
-
-    # Transform type: "fft" (frequency filtering) or "ma" (repeated moving average)
-    transform_type: Literal["fft", "ma"] = "fft"
-    ma_kernel_size: int = 3  # box-kernel width for MA transform
 
     # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
     # When enabled, training timesteps are sampled non-uniformly via a

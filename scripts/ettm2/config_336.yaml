@@ -31,17 +31,11 @@ model:
   # Diffusion
   num_diffusion_steps: 1000
   num_sampling_steps: 20
-  num_fft_stages: 0
-  stage_schedule: linear    # linear | cosine | quadratic | sqrt
-  topk_schedule: linear     # linear | cosine | quadratic | sqrt
   noise_schedule: linear    # linear | cosine | quad | sigmoid
   beta_start: 0.0001
   beta_end: 0.1
   eta: 1.0                  # DDIM eta; 0 = deterministic
 
-  # Staged transform: "fft" (frequency filtering) or "ma" (repeated moving average)
-  transform_type: ma
-  ma_kernel_size: 3           # box-kernel width (only used when transform_type=ma)
 
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
   bernoulli_sampling: true
