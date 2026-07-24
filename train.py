@@ -22,6 +22,7 @@ from torch.amp import GradScaler
 from torch import autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from einops import rearrange
 
 # Ensure the repo root is on the path so `src.*` imports work when
 # running from inside the fft_diff/ directory.
@@ -61,7 +62,7 @@ def evaluate(
     computing metrics so that scores are in original scale.
     """
     model.eval()
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_samples = [], [], []
     timestep_losses = defaultdict(list)
     for ctx, tgt in loader:
         ctx, tgt = ctx.to(device), tgt.to(device)
@@ -85,11 +86,15 @@ def evaluate(
         # np.savez('target', norm_tgt.detach().cpu().numpy())
 
         if revin is not None:
+            # RevIN stats are [B, 1, C]; repeat to [B*N, 1, C] for all ensemble members
+            revin.mean = revin.mean.repeat_interleave(num_samples, dim=0)
+            revin.stdev = revin.stdev.repeat_interleave(num_samples, dim=0)
             pred = revin(pred, mode="denorm")
-            # tgt is already in original scale (not normalized)
+        pred = rearrange(pred, "(b n) l c -> b n l c", n=num_samples)
 
-        all_preds.append(pred.cpu())
+        all_preds.append(pred.mean(1).cpu())
         all_targets.append(tgt.cpu())
+        all_samples.append(pred.cpu())
 
     # timestep_losses = dict(timestep_losses)
 
@@ -99,7 +104,8 @@ def evaluate(
     # )
     preds = torch.cat(all_preds, dim=0)
     targets = torch.cat(all_targets, dim=0)
-    return compute_metrics(preds, targets)
+    candidates = torch.cat(all_samples, dim=0)
+    return compute_metrics(preds, targets, samples=candidates)
 
 
 # ── CLI parsing ───────────────────────────────────────────────────────────────
@@ -382,7 +388,7 @@ def main():
             metrics = evaluate(model, val_loader, device, revin=revin,
                                num_samples=tcfg.num_samples, stop_step=stop_step,
                                eval_length=tcfg.eval_prediction_length)
-            print(f"  ↳ Val  MSE={metrics['mse']:.4f}  MAE={metrics['mae']:.4f}  RMSE={metrics['rmse']:.4f}")
+            print(f"  ↳ Val  MSE={metrics['mse']:.4f}  MAE={metrics['mae']:.4f}  RMSE={metrics['rmse']:.4f}  CRPS={metrics['crps']:.4f}")
 
             if metrics["mse"] < best_val_mse:
                 best_val_mse = metrics["mse"]
@@ -467,7 +473,7 @@ def main():
                             num_samples=tcfg.num_samples, stop_step=stop_step,
                             eval_length=tcfg.eval_prediction_length)
     print(f"\nTest  MSE={test_metrics['mse']:.4f}  MAE={test_metrics['mae']:.4f}  "
-          f"RMSE={test_metrics['rmse']:.4f}")
+          f"RMSE={test_metrics['rmse']:.4f}  CRPS={test_metrics['crps']:.4f}")
 
 
 if __name__ == "__main__":

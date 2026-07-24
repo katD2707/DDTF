@@ -6,6 +6,9 @@ from typing import Dict, List
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+import numpy as np
+import CRPS.CRPS as pscore
+from multiprocessing import Pool, cpu_count
 
 
 def mse(pred: Tensor, target: Tensor) -> float:
@@ -20,11 +23,51 @@ def rmse(pred: Tensor, target: Tensor) -> float:
     return math.sqrt(mse(pred, target))
 
 
-def compute_metrics(pred: Tensor, target: Tensor) -> Dict[str, float]:
+def _crps_worker(args):
+    """Compute CRPS for a single batch element (all timesteps & channels)."""
+    samples_b, target_b = args  # samples_b: [N, L, C], target_b: [L, C]
+    L, C = target_b.shape
+    total = 0.0
+    for l in range(L):
+        for c in range(C):
+            result = pscore(samples_b[:, l, c], target_b[l, c]).compute()
+            total += result[0]
+    return total, L * C
+
+
+def crps(samples: Tensor, target: Tensor) -> float:
+    samples_np = samples.detach().cpu().numpy()
+    target_np = target.detach().cpu().numpy()
+
+    B = samples_np.shape[0]
+    worker_args = [(samples_np[b], target_np[b]) for b in range(B)]
+
+    n_workers = min(B, cpu_count())
+    with Pool(n_workers) as pool:
+        results = pool.map(_crps_worker, worker_args)
+
+    total = sum(r[0] for r in results)
+    count = sum(r[1] for r in results)
+    return total / count
+
+
+def compute_metrics(
+    pred: Tensor,
+    target: Tensor,
+    samples: Tensor,
+) -> Dict[str, float]:
+    """Compute forecasting metrics.
+
+    Args:
+        pred:    [B, L, C]           point forecast (e.g. ensemble mean)
+        target:  [B, L, C]           ground truth
+        samples: [B, N, L, C]        ensemble members for CRPS
+    """
     return {
         "mse": mse(pred, target),
         "mae": mae(pred, target),
         "rmse": rmse(pred, target),
+        "crps": crps(samples, target)
     }
 
 

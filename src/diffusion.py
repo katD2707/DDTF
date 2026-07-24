@@ -261,7 +261,7 @@ class FFTDiffusion(nn.Module):
             stop_step:              if set, stop full-mode sampling at this t
             return_scores:          if True, return (pred, scores, steps)
         Returns:
-            predictions [B, eval_len, C]  (or tuple when return_scores=True)
+            predictions [B, N, eval_len, C]  (or tuple when return_scores=True)
         """
         B_orig, _, C = context.shape
         device = context.device
@@ -315,9 +315,6 @@ class FFTDiffusion(nn.Module):
             sigma = self.eta * ((1 - alpha_t / alpha_s) * (1 - alpha_s) / (1 - alpha_t)).sqrt()
             c_coef = (1 - alpha_s - sigma ** 2).sqrt()
             y_t = y0_pred * alpha_s.sqrt() + c_coef * noise_pred + sigma * torch.randn_like(y_t)
-
-        if num_samples > 1:
-            y0_pred = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(1)
 
         if return_scores:
             scores = torch.stack(all_scores, dim=1)
