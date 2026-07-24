@@ -18,6 +18,7 @@ from typing import Optional
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from einops import rearrange
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -26,6 +27,7 @@ from src.dataset import load_csv_dataset
 from src.diffusion import FFTDiffusion
 from src.metrics import compute_metrics
 from src.revin import RevIN
+from src.early_stopping import find_global_early_stop
 
 
 def parse_args():
@@ -77,7 +79,15 @@ def load_from_checkpoint(checkpoint_path: str, device: torch.device):
     # Load RevIN if present
     revin = None
     if mcfg.use_revin and "revin" in ckpt:
-        revin = RevIN(num_features=mcfg.num_features, affine=mcfg.revin_affine).to(device)
+        revin = RevIN(
+            num_features=mcfg.num_features,
+            in_len=mcfg.context_length,
+            out_len=model.condition_encoder.num_patches,
+            affine=mcfg.revin_affine,
+            use_de_stationary=mcfg.use_de_stationary,
+            p_hidden_dims=mcfg.p_hidden_dims,
+            p_hidden_layers=mcfg.p_hidden_layers,
+        ).to(device)
         revin.load_state_dict(ckpt["revin"])
 
     return model, revin, cfg
@@ -91,29 +101,39 @@ def run_evaluation(
     revin: Optional[RevIN] = None,
     num_samples: int = 1,
     stop_step: Optional[int] = None,
+    eval_length: Optional[int] = None,
 
 ):
     """Run evaluation, returning metrics + raw arrays."""
     model.eval()
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_samples = [], [], []
 
     for ctx, tgt in loader:
         ctx, tgt = ctx.to(device), tgt.to(device)
 
+        tau, delta = None, None
         if revin is not None:
-            ctx = revin(ctx, mode="norm")
+            ctx, tau, delta = revin(ctx, mode="norm")
 
-        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step)
+        pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
+                            eval_prediction_length=eval_length,
+                            tau=tau, delta=delta)
 
         if revin is not None:
+            # RevIN stats are [B, 1, C]; repeat to [B*N, 1, C] for all ensemble members
+            revin.mean = revin.mean.repeat_interleave(num_samples, dim=0)
+            revin.stdev = revin.stdev.repeat_interleave(num_samples, dim=0)
             pred = revin(pred, mode="denorm")
+        pred = rearrange(pred, "(b n) l c -> b n l c", n=num_samples)
 
-        all_preds.append(pred.cpu())
+        all_preds.append(pred.mean(1).cpu())
         all_targets.append(tgt.cpu())
+        all_samples.append(pred.cpu())
 
     preds = torch.cat(all_preds, dim=0)
     targets = torch.cat(all_targets, dim=0)
-    metrics = compute_metrics(preds, targets)
+    candidates = torch.cat(all_samples, dim=0)
+    metrics = compute_metrics(preds, targets, samples=candidates)
     return metrics, preds.numpy(), targets.numpy()
 
 
@@ -161,10 +181,17 @@ def main():
         print("Calibrating auto-stop from pilot samples...")
         pilot_ctx, _ = next(iter(test_loader))
         pilot_ctx = pilot_ctx[:args.num_pilot_samples].to(device)
+        tau, delta = None, None
         if revin is not None:
-            pilot_ctx = revin(pilot_ctx, mode="norm")
-        es = model.find_optimal_stop_step(
+            pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+        _, scores, steps = model.sample(
             pilot_ctx, num_samples=args.num_samples,
+            return_scores=True, tau=tau, delta=delta,
+        )
+        es = find_global_early_stop(
+            scores=scores, steps=steps,
+            smooth_window=None,
+            min_frac=0.1,
             safety_margin=args.auto_stop_safety_margin,
         )
         stop_step = es["stop_step"]
@@ -183,6 +210,7 @@ def main():
     print(f"  MSE  = {metrics['mse']:.6f}")
     print(f"  MAE  = {metrics['mae']:.6f}")
     print(f"  RMSE = {metrics['rmse']:.6f}")
+    print(f"  CRPS = {metrics['crps']:.6f}")
 
     # ── Save ──────────────────────────────────────────────────────────────
     if args.save_predictions:
