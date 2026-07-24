@@ -83,6 +83,7 @@ def evaluate(
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
                              eval_prediction_length=eval_length,
                              tau=tau, delta=delta)
+        # np.savez('source', ctx.detach().cpu().numpy())
         # np.savez('target', norm_tgt.detach().cpu().numpy())
 
         if revin is not None:

@@ -228,7 +228,7 @@ class FFTDiffusion(nn.Module):
         denoise_loss +=  1.0 * fourier_loss
 
         # Filter outliers
-        denoise_loss = denoise_loss[denoise_loss < 100].mean()
+        denoise_loss = denoise_loss.mean()
 
         return {
             "total": denoise_loss,
@@ -295,10 +295,9 @@ class FFTDiffusion(nn.Module):
             t_input = t_b.unsqueeze(1).expand(B_eff, eval_len)
             y0_pred = self.denoiser(y_t, t_input, cond, tau=tau, delta=delta)
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
-
+            all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).detach().cpu().numpy())
             if return_scores:
                 c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(1)
-                all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).detach().cpu().numpy())
                 all_scores.append(c_avg.mean(dim=(-2, -1)))
                 all_steps.append(t_now)
 
