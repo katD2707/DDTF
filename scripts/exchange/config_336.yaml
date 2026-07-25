@@ -22,11 +22,11 @@ model:
   n_encoder_layers: 2
 
   d_model_denoiser: 128
-  n_denoiser_layers: 3
+  n_denoiser_layers: 1
 
   n_heads: 4
-  mlp_ratio: 4
-  dropout: 0.4
+  mlp_ratio: 1
+  dropout: 0.2
 
   # Diffusion
   num_diffusion_steps: 1000

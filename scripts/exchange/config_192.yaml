@@ -22,11 +22,11 @@ model:
   n_encoder_layers: 2
 
   d_model_denoiser: 128
-  n_denoiser_layers: 3
+  n_denoiser_layers: 1
 
   n_heads: 4
-  mlp_ratio: 4
-  dropout: 0.4
+  mlp_ratio: 1
+  dropout: 0.2
 
   # Diffusion
   num_diffusion_steps: 1000
@@ -58,7 +58,7 @@ training:
   amp_dtype: float16         # float16 or bfloat16
 
   # Training early stopping (patience-based on val MSE)
-  patience: 5                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
+  patience: 10                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
 
   # Resume from checkpoint
   resume: ""                 # path to epoch_N.pt checkpoint, empty = start fresh
