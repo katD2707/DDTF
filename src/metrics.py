@@ -54,7 +54,7 @@ def crps(samples: Tensor, target: Tensor) -> float:
 def compute_metrics(
     pred: Tensor,
     target: Tensor,
-    samples: Tensor,
+    samples: Tensor = None,
 ) -> Dict[str, float]:
     """Compute forecasting metrics.
 
@@ -67,7 +67,7 @@ def compute_metrics(
         "mse": mse(pred, target),
         "mae": mae(pred, target),
         "rmse": rmse(pred, target),
-        "crps": crps(samples, target)
+        "crps": crps(samples, target) if samples is not None else -1
     }
 
 

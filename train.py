@@ -106,7 +106,7 @@ def evaluate(
     preds = torch.cat(all_preds, dim=0)
     targets = torch.cat(all_targets, dim=0)
     candidates = torch.cat(all_samples, dim=0)
-    return compute_metrics(preds, targets, samples=candidates)
+    return compute_metrics(preds, targets)
 
 
 # ── CLI parsing ───────────────────────────────────────────────────────────────
@@ -215,7 +215,6 @@ def main():
         dcfg.csv,
         context_length=mcfg.context_length,
         prediction_length=mcfg.prediction_length,
-        eval_prediction_length=tcfg.eval_prediction_length,
         target_col=dcfg.target_col,
     )
     mcfg.num_features = train_ds.num_channels
@@ -388,7 +387,7 @@ def main():
 
             metrics = evaluate(model, val_loader, device, revin=revin,
                                num_samples=tcfg.num_samples, stop_step=stop_step,
-                               eval_length=tcfg.eval_prediction_length)
+                               eval_length=mcfg.prediction_length)
             print(f"  ↳ Val  MSE={metrics['mse']:.4f}  MAE={metrics['mae']:.4f}  RMSE={metrics['rmse']:.4f}  CRPS={metrics['crps']:.4f}")
 
             if metrics["mse"] < best_val_mse:
@@ -472,7 +471,7 @@ def main():
 
     test_metrics = evaluate(model, test_loader, device, revin=revin,
                             num_samples=tcfg.num_samples, stop_step=stop_step,
-                            eval_length=tcfg.eval_prediction_length)
+                            eval_length=mcfg.prediction_length)
     print(f"\nTest  MSE={test_metrics['mse']:.4f}  MAE={test_metrics['mae']:.4f}  "
           f"RMSE={test_metrics['rmse']:.4f}  CRPS={test_metrics['crps']:.4f}")
 

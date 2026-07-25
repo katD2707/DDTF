@@ -111,7 +111,6 @@ def load_csv_dataset(
     csv_path: str,
     context_length: int = 96,
     prediction_length: int = 1056,
-    eval_prediction_length: int = 96,
     target_col: Optional[str] = None,
 
 ):
@@ -161,6 +160,6 @@ def load_csv_dataset(
     test_data  = data[splits["test"][0] - context_length : splits["test"][1]]
 
     train_ds = TimeSeriesDataset(train_data, context_length, prediction_length)
-    val_ds   = TimeSeriesDataset(val_data,   context_length, eval_prediction_length, scaler=train_ds.scaler)
-    test_ds  = TimeSeriesDataset(test_data,  context_length, eval_prediction_length, scaler=train_ds.scaler)
+    val_ds   = TimeSeriesDataset(val_data,   context_length, prediction_length, scaler=train_ds.scaler)
+    test_ds  = TimeSeriesDataset(test_data,  context_length, prediction_length, scaler=train_ds.scaler)
     return train_ds, val_ds, test_ds

@@ -47,7 +47,7 @@ def parse_args():
 
     # Early stopping during sampling
     parser.add_argument("--use_auto_stop", action="store_true", default=False)
-    parser.add_argument("--num_pilot_samples", type=int, default=100)
+    parser.add_argument("--num_pilot_samples", type=int, default=128)
     parser.add_argument("--auto_stop_safety_margin", type=int, default=0)
 
     # Output
@@ -88,7 +88,7 @@ def load_from_checkpoint(checkpoint_path: str, device: torch.device):
             p_hidden_dims=mcfg.p_hidden_dims,
             p_hidden_layers=mcfg.p_hidden_layers,
         ).to(device)
-        revin.load_state_dict(ckpt["revin"])
+        revin.load_state_dict(ckpt["revin"], strict=False)
 
     return model, revin, cfg
 
@@ -179,17 +179,23 @@ def main():
     stop_step = None
     if args.use_auto_stop:
         print("Calibrating auto-stop from pilot samples...")
-        pilot_ctx, _ = next(iter(test_loader))
-        pilot_ctx = pilot_ctx[:args.num_pilot_samples].to(device)
-        tau, delta = None, None
-        if revin is not None:
-            pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
-        _, scores, steps = model.sample(
-            pilot_ctx, num_samples=args.num_samples,
-            return_scores=True, tau=tau, delta=delta,
-        )
+        pilot_eval_count = 0
+        all_scores = []
+        test_dtl = iter(test_loader)
+        while pilot_eval_count < args.num_pilot_samples:
+            pilot_ctx, _ = next(test_dtl)
+            pilot_ctx = pilot_ctx[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
+            tau, delta = None, None
+            if revin is not None:
+                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+            _, scores, steps = model.sample(
+                pilot_ctx, num_samples=args.num_samples, return_scores=True, tau=tau, delta=delta,
+            )
+            pilot_eval_count += args.batch_size
+            all_scores.append(scores)
+        all_scores = torch.cat(all_scores, dim=0)
         es = find_global_early_stop(
-            scores=scores, steps=steps,
+            scores=all_scores, steps=steps,
             smooth_window=None,
             min_frac=0.1,
             safety_margin=args.auto_stop_safety_margin,

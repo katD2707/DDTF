@@ -121,7 +121,6 @@ class TrainingConfig:
 
     # Sampling
     num_samples: int = 1              # ensemble size for evaluation
-    eval_prediction_length: int = 0
 
     # Logging
     log_interval: int = 50

@@ -68,7 +68,6 @@ training:
 
   # Sampling
   num_samples: 30              # ensemble size for evaluation
-  eval_prediction_length: 192
 
   # Logging & checkpointing
   num_workers: 2
