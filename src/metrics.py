@@ -35,21 +35,57 @@ def _crps_worker(args):
     return total, L * C
 
 
+# def crps(samples: Tensor, target: Tensor) -> float:
+#     samples_np = samples.detach().cpu().numpy()
+#     target_np = target.detach().cpu().numpy()
+
+#     B = samples_np.shape[0]
+#     worker_args = [(samples_np[b], target_np[b]) for b in range(B)]
+
+#     n_workers = min(B, cpu_count())
+#     with Pool(n_workers) as pool:
+#         results = pool.map(_crps_worker, worker_args)
+
+#     total = sum(r[0] for r in results)
+#     count = sum(r[1] for r in results)
+#     return total / count
+
 def crps(samples: Tensor, target: Tensor) -> float:
     samples_np = samples.detach().cpu().numpy()
     target_np = target.detach().cpu().numpy()
+    num_samples = samples_np.shape[1]
 
-    B = samples_np.shape[0]
-    worker_args = [(samples_np[b], target_np[b]) for b in range(B)]
+    # First empirical CRPS term: E|X - y|.
+    residuals = np.empty(samples_np.shape, dtype=np.float64)
+    np.subtract(
+        samples_np,
+        target_np[:, None, :, :],
+        out=residuals,
+        dtype=np.float64,
+    )
+    np.abs(residuals, out=residuals)
+    term1 = np.mean(residuals, axis=1, dtype=np.float64)
 
-    n_workers = min(B, cpu_count())
-    with Pool(n_workers) as pool:
-        results = pool.map(_crps_worker, worker_args)
+    # Efficiently compute 0.5 * E|X - X'| from sorted ensemble samples.
+    weights = (
+        2.0 * np.arange(1, num_samples + 1, dtype=np.float64)
+        - num_samples
+        - 1.0
+    ).reshape(1, num_samples, 1, 1)
+    sorted_samples = np.sort(samples_np, axis=1)
+    term2 = np.sum(
+        sorted_samples * weights,
+        axis=1,
+        dtype=np.float64,
+    ) / (num_samples ** 2)
 
-    total = sum(r[0] for r in results)
-    count = sum(r[1] for r in results)
-    return total / count
+    crps_values = term1 - term2
+    result = float(crps_values.mean(dtype=np.float64))
 
+    if not np.isfinite(result):
+        raise ValueError("CRPS result is non-finite")
+
+    return result
 
 def compute_metrics(
     pred: Tensor,
