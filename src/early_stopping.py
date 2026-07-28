@@ -29,15 +29,21 @@ def _segment_sse(n, sx, sy, sxx, sxy, syy, eps=1e-12):
     """SSE of best linear fit for a segment given sufficient statistics."""
     denom = n * sxx - sx * sx
     valid = n >= 2
-    a = torch.zeros_like(sx)
-    b = torch.zeros_like(sx)
     good = valid & (denom.abs() > eps)
-    a[good] = (n[good] * sxy[good] - sx[good] * sy[good]) / denom[good]
-    b[good] = (sy[good] - a[good] * sx[good]) / n[good]
     fallback = valid & ~good
-    b[fallback] = sy[fallback] / n[fallback]
+
+    denom_safe = torch.where(denom.abs() > eps, denom, torch.ones_like(denom))
+    n_safe = torch.where(n > 0, n, torch.ones_like(n))
+
+    a_calc = (n * sxy - sx * sy) / denom_safe
+    a = torch.where(good, a_calc, torch.zeros_like(sy))
+
+    b_calc = (sy - a * sx) / n_safe
+    b_fallback = sy / n_safe
+    b = torch.where(good, b_calc, torch.where(fallback, b_fallback, torch.zeros_like(sy)))
+
     sse = syy - 2 * a * sxy - 2 * b * sy + a * a * sxx + 2 * a * b * sx + n * b * b
-    sse[~valid] = torch.inf
+    sse = torch.where(valid, sse, torch.full_like(sse, float("inf")))
     return sse
 
 
@@ -74,30 +80,63 @@ def find_global_early_stop(
     if smooth_window is None:
         smooth_window = _make_odd(max(5, min(int(round(T * 0.03)), max(5, T // 4))))
 
-    y = _smooth_1d_batch(scores, smooth_window).median(dim=0).values  # [T]
+    # Smooth score trajectories per sample: shape [N, T]
+    smoothed_scores = _smooth_1d_batch(scores, smooth_window)
+
     x = steps
 
     # Prefix sums for piecewise-linear fit
     ones = torch.ones_like(x)
-    cn, cx, cy = torch.cumsum(ones, 0), torch.cumsum(x, 0), torch.cumsum(y, 0)
-    cxx, cxy, cyy = torch.cumsum(x * x, 0), torch.cumsum(x * y, 0), torch.cumsum(y * y, 0)
+    cn = torch.cumsum(ones, 0)
+    cx = torch.cumsum(x, 0)
+    cxx = torch.cumsum(x * x, 0)
+
+    cy = torch.cumsum(smoothed_scores, 1)
+    cxy = torch.cumsum(x.unsqueeze(0) * smoothed_scores, 1)
+    cyy = torch.cumsum(smoothed_scores * smoothed_scores, 1)
 
     min_seg = max(2, int(round(T * min_frac)))
     taus = torch.arange(min_seg, T - min_seg, device=device)
 
-    ln, lx, ly = cn[taus - 1], cx[taus - 1], cy[taus - 1]
-    lxx, lxy, lyy = cxx[taus - 1], cxy[taus - 1], cyy[taus - 1]
-    rn, rx, ry = cn[-1] - ln, cx[-1] - lx, cy[-1] - ly
-    rxx, rxy, ryy = cxx[-1] - lxx, cxy[-1] - lxy, cyy[-1] - lyy
+    ln = cn[taus - 1]
+    lx = cx[taus - 1]
+    lxx = cxx[taus - 1]
+    ly = cy[:, taus - 1]
+    lxy = cxy[:, taus - 1]
+    lyy = cyy[:, taus - 1]
 
-    total = _segment_sse(ln, lx, ly, lxx, lxy, lyy) + _segment_sse(rn, rx, ry, rxx, rxy, ryy)
+    rn = cn[-1] - ln
+    rx = cx[-1] - lx
+    rxx = cxx[-1] - lxx
+    ry = cy[:, -1:] - ly
+    rxy = cxy[:, -1:] - lxy
+    ryy = cyy[:, -1:] - lyy
 
-    best = taus[torch.argmin(total)].item()
-    stop_idx = max(0, best - safety_margin)
+    left_sse = _segment_sse(ln, lx, ly, lxx, lxy, lyy)
+    right_sse = _segment_sse(rn, rx, ry, rxx, rxy, ryy)
+    total_sse = left_sse + right_sse  # [N, num_taus]
+
+    # Best breakpoint index per sample
+    sample_best_tau_indices = torch.argmin(total_sse, dim=1)  # [N]
+    sample_best_indices = taus[sample_best_tau_indices]       # [N]
+    sample_stop_indices = torch.clamp(sample_best_indices - safety_margin, min=0)  # [N]
+
+    sample_breakpoint_steps = steps[sample_best_indices]     # [N]
+    sample_stop_steps = steps[sample_stop_indices]           # [N]
+
+    # Take median across all samples
+    breakpoint_step = sample_breakpoint_steps.float().median().item()
+    stop_step = sample_stop_steps.float().median().item()
+
+    # Median curve across samples for reference/visualization
+    median_curve = smoothed_scores.median(dim=0).values
 
     return {
-        "breakpoint_step": steps[best].item(),
-        "stop_step": steps[stop_idx].item(),
-        "median_curve": y,
+        "breakpoint_step": breakpoint_step,
+        "stop_step": stop_step,
+        "median_curve": median_curve,
         "smooth_window": smooth_window,
+        "sample_breakpoint_steps": sample_breakpoint_steps,
+        "sample_stop_steps": sample_stop_steps,
     }
+
