@@ -164,14 +164,21 @@ def main():
         model.num_sampling_steps = args.num_sampling_steps
 
     # ── Data ──────────────────────────────────────────────────────────────
-    _, _, test_ds = load_csv_dataset(
+    train_ds, val_ds, test_ds = load_csv_dataset(
         cfg.data.csv,
         context_length=mcfg.context_length,
         prediction_length=mcfg.prediction_length,
         target_col=cfg.data.target_col,
     )
+    print(f"Train samples: {len(train_ds)}")
+    print(f"Validation samples: {len(val_ds)}")
     print(f"Test samples: {len(test_ds)}")
 
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
+                              num_workers=0, pin_memory=device.type == "cuda",
+                              drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=0, pin_memory=device.type == "cuda")
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=0, pin_memory=device.type == "cuda")
 
@@ -200,8 +207,40 @@ def main():
             min_frac=0.1,
             safety_margin=args.auto_stop_safety_margin,
         )
+        es = find_global_early_stop(
+            scores=all_scores, steps=steps,
+            smooth_window=None,
+            min_frac=0.1,
+            safety_margin=args.auto_stop_safety_margin,
+        )
         stop_step = es["stop_step"]
+        print("Validation auto-stop from pilot ground-truth...")
+        pilot_eval_count = 0
+        all_scores = []
+        test_dtl = iter(val_loader)
+        while pilot_eval_count < args.num_pilot_samples:
+            pilot_ctx, pilot_tgt = next(test_dtl)
+            pilot_ctx = pilot_ctx[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
+            pilot_tgt = pilot_tgt[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
+            tau, delta = None, None
+            if revin is not None:
+                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+                pilot_tgt, _, _ = revin(tgt, mode="norm", reuse_stats=True)
+            _, scores, steps = model.sample(
+                pilot_ctx, num_samples=args.num_samples, return_scores=True, tau=tau, delta=delta, tgt=pilot_tgt,
+            )
+            pilot_eval_count += args.batch_size
+            all_scores.append(scores)
+        all_scores = torch.cat(all_scores, dim=0)
+        es_val = find_global_early_stop(
+            scores=all_scores, steps=steps,
+            smooth_window=None,
+            min_frac=0.1,
+            safety_margin=args.auto_stop_safety_margin,
+        )
+        stop_step_val = es_val["stop_step"]
         print(f"  Auto-stop: step={stop_step} (breakpoint={es['breakpoint_step']:.0f})")
+        print(f"  Validation Auto-stop: step={stop_step_val} (breakpoint={es_val['breakpoint_step']:.0f})")
 
     # ── Evaluate ──────────────────────────────────────────────────────────
     print("Running evaluation...")

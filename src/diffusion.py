@@ -248,6 +248,7 @@ class FFTDiffusion(nn.Module):
         return_scores: bool = False,
         tau: Optional[Tensor] = None,
         delta: Optional[Tensor] = None,
+        tgt: Optional[Tensor] = None,
     ):
         """
         Generate forecasts using DDIM sampling.
@@ -297,7 +298,10 @@ class FFTDiffusion(nn.Module):
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
             all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).detach().cpu().numpy())
             if return_scores:
-                c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(1)
+                if tgt is None:
+                    c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(1)
+                else:
+                    c_avg = ((rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples)-tgt.unsqueeze(1))**2).mean(1)
                 all_scores.append(c_avg.mean(dim=(-2, -1)))
                 all_steps.append(t_now)
 
