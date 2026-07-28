@@ -302,7 +302,7 @@ class FFTDiffusion(nn.Module):
                     c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(1)
                 else:
                     c_avg = ((rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples)-tgt.unsqueeze(1))**2).mean(1)
-                all_scores.append(c_avg.mean(dim=(-2, -1)))
+                all_scores.append(rearrange(c_avg, "b l c -> (b c) l").mean(-1))
                 all_steps.append(t_now)
 
             # Early stopping

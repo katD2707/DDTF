@@ -225,7 +225,7 @@ def main():
             tau, delta = None, None
             if revin is not None:
                 pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
-                pilot_tgt, _, _ = revin(tgt, mode="norm", reuse_stats=True)
+                pilot_tgt, _, _ = revin(pilot_tgt, mode="norm", reuse_stats=True)
             _, scores, steps = model.sample(
                 pilot_ctx, num_samples=args.num_samples, return_scores=True, tau=tau, delta=delta, tgt=pilot_tgt,
             )
@@ -239,8 +239,34 @@ def main():
             safety_margin=args.auto_stop_safety_margin,
         )
         stop_step_val = es_val["stop_step"]
-        print(f"  Auto-stop: step={stop_step} (breakpoint={es['breakpoint_step']:.0f})")
-        print(f"  Validation Auto-stop: step={stop_step_val} (breakpoint={es_val['breakpoint_step']:.0f})")
+        print("Train auto-stop from pilot ground-truth...")
+        pilot_eval_count = 0
+        all_scores = []
+        test_dtl = iter(train_loader)
+        while pilot_eval_count < args.num_pilot_samples:
+            pilot_ctx, pilot_tgt = next(test_dtl)
+            pilot_ctx = pilot_ctx[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
+            pilot_tgt = pilot_tgt[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
+            tau, delta = None, None
+            if revin is not None:
+                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+                pilot_tgt, _, _ = revin(pilot_tgt, mode="norm", reuse_stats=True)
+            _, scores, steps = model.sample(
+                pilot_ctx, num_samples=args.num_samples, return_scores=True, tau=tau, delta=delta, tgt=pilot_tgt,
+            )
+            pilot_eval_count += args.batch_size
+            all_scores.append(scores)
+        all_scores = torch.cat(all_scores, dim=0)
+        es_train = find_global_early_stop(
+            scores=all_scores, steps=steps,
+            smooth_window=None,
+            min_frac=0.1,
+            safety_margin=args.auto_stop_safety_margin,
+        )
+        stop_step_train = es_train["stop_step"]
+        print(f"  Valid Mean Auto-stop: step={stop_step} (breakpoint={es['breakpoint_step']:.0f})")
+        print(f"  Train GT Auto-stop: step={stop_step_train} (breakpoint={es_train['breakpoint_step']:.0f})")
+        print(f"  Valid GT Auto-stop: step={stop_step_val} (breakpoint={es_val['breakpoint_step']:.0f})")
 
     # ── Evaluate ──────────────────────────────────────────────────────────
     print("Running evaluation...")

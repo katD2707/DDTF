@@ -106,7 +106,7 @@ def evaluate(
     preds = torch.cat(all_preds, dim=0)
     targets = torch.cat(all_targets, dim=0)
     candidates = torch.cat(all_samples, dim=0)
-    return compute_metrics(preds, targets)
+    return compute_metrics(preds, targets, candidates)
 
 
 # ── CLI parsing ───────────────────────────────────────────────────────────────
