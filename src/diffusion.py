@@ -296,18 +296,15 @@ class FFTDiffusion(nn.Module):
             t_input = t_b.unsqueeze(1).expand(B_eff, eval_len)
             y0_pred = self.denoiser(y_t, t_input, cond, tau=tau, delta=delta)
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
-            all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).detach().cpu().numpy())
+            all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> (b n c) l", n=num_samples))
             if return_scores:
                 if tgt is None:
-                    c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(1)
+                    c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(2)
                 else:
-                    c_avg = ((rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples)-tgt.unsqueeze(1))**2).mean(1)
-                all_scores.append(rearrange(c_avg, "b l c -> (b c) l").mean(-1))
+                    c_avg = ((rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples)-tgt.unsqueeze(1))**2).mean(2)
+                all_scores.append(rearrange(c_avg, "b n c -> (b n c)"))
                 all_steps.append(t_now)
 
-            # Early stopping
-            if not return_scores and stop_step is not None and t_now <= stop_step:
-                break
 
             if t_next < 0:
                 # np.savez('cand_all', np.stack(all_cand_scores, axis=1))
@@ -319,10 +316,19 @@ class FFTDiffusion(nn.Module):
             c_coef = (1 - alpha_s - sigma ** 2).sqrt()
             y_t = y0_pred * alpha_s.sqrt() + c_coef * noise_pred + sigma * torch.randn_like(y_t)
 
+        scores = torch.stack(all_scores, dim=1)
+        steps = torch.tensor(all_steps, device=y0_pred.device, dtype=torch.float)
+        es = find_global_early_stop(
+            scores=scores, steps=steps,
+            smooth_window=None,
+            min_frac=0.1,
+            safety_margin=0,
+        )
+        y0_pred_steps = torch.stack(all_cand_scores, dim=1)     # [BNC, T, L]
+        y0_pred = y0_pred_steps[torch.arange(y0_pred_steps.shape[0], device=y0_pred.device), es["sample_stop_indices"]]
+        y0_pred = rearrange(y0_pred, "(b n c) l -> (b n) l c", n=num_samples, c=C)
         if return_scores:
-            scores = torch.stack(all_scores, dim=1)
-            steps_t = torch.tensor(all_steps, device=y0_pred.device, dtype=torch.float)
-            return y0_pred, scores, steps_t
+            return y0_pred, scores, steps
         return y0_pred
 
     # ── Factory ───────────────────────────────────────────────────────────

@@ -138,5 +138,7 @@ def find_global_early_stop(
         "smooth_window": smooth_window,
         "sample_breakpoint_steps": sample_breakpoint_steps,
         "sample_stop_steps": sample_stop_steps,
+        "sample_stop_indices": sample_stop_indices,
+        "sample_best_indices": sample_best_indices,
     }
 
