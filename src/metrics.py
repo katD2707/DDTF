@@ -6,9 +6,6 @@ from typing import Dict, List
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-import numpy as np
-import CRPS.CRPS as pscore
-from multiprocessing import Pool, cpu_count
 
 
 def mse(pred: Tensor, target: Tensor) -> float:
@@ -23,66 +20,37 @@ def rmse(pred: Tensor, target: Tensor) -> float:
     return math.sqrt(mse(pred, target))
 
 
-def _crps_worker(args):
-    """Compute CRPS for a single batch element (all timesteps & channels)."""
-    samples_b, target_b = args  # samples_b: [N, L, C], target_b: [L, C]
-    L, C = target_b.shape
-    total = 0.0
-    for l in range(L):
-        for c in range(C):
-            result = pscore(samples_b[:, l, c], target_b[l, c]).compute()
-            total += result[0]
-    return total, L * C
-
-
-# def crps(samples: Tensor, target: Tensor) -> float:
-#     samples_np = samples.detach().cpu().numpy()
-#     target_np = target.detach().cpu().numpy()
-
-#     B = samples_np.shape[0]
-#     worker_args = [(samples_np[b], target_np[b]) for b in range(B)]
-
-#     n_workers = min(B, cpu_count())
-#     with Pool(n_workers) as pool:
-#         results = pool.map(_crps_worker, worker_args)
-
-#     total = sum(r[0] for r in results)
-#     count = sum(r[1] for r in results)
-#     return total / count
-
 def crps(samples: Tensor, target: Tensor) -> float:
-    samples_np = samples.detach().cpu().numpy()
-    target_np = target.detach().cpu().numpy()
-    num_samples = samples_np.shape[1]
+    """Compute Continuous Ranked Probability Score (CRPS) using PyTorch.
 
-    # First empirical CRPS term: E|X - y|.
-    residuals = np.empty(samples_np.shape, dtype=np.float64)
-    np.subtract(
-        samples_np,
-        target_np[:, None, :, :],
-        out=residuals,
-        dtype=np.float64,
-    )
-    np.abs(residuals, out=residuals)
-    term1 = np.mean(residuals, axis=1, dtype=np.float64)
+    Args:
+        samples: [B, N, L, C] - Ensemble predictions
+        target:  [B, L, C]    - Ground truth targets
 
-    # Efficiently compute 0.5 * E|X - X'| from sorted ensemble samples.
+    Returns:
+        float: Mean CRPS value over all batch elements, timesteps, and channels.
+    """
+    samples_double = samples.detach().to(dtype=torch.float64)
+    target_double = target.detach().to(dtype=torch.float64)
+    num_samples = samples_double.shape[1]
+
+    # First empirical CRPS term: E|X - y|
+    term1 = torch.abs(samples_double - target_double.unsqueeze(1)).mean(dim=1)
+
+    # Efficiently compute 0.5 * E|X - X'| from sorted ensemble samples
     weights = (
-        2.0 * np.arange(1, num_samples + 1, dtype=np.float64)
+        2.0 * torch.arange(1, num_samples + 1, device=samples.device, dtype=torch.float64)
         - num_samples
         - 1.0
-    ).reshape(1, num_samples, 1, 1)
-    sorted_samples = np.sort(samples_np, axis=1)
-    term2 = np.sum(
-        sorted_samples * weights,
-        axis=1,
-        dtype=np.float64,
-    ) / (num_samples ** 2)
+    ).view(1, num_samples, 1, 1)
+
+    sorted_samples, _ = torch.sort(samples_double, dim=1)
+    term2 = torch.sum(sorted_samples * weights, dim=1) / (num_samples ** 2)
 
     crps_values = term1 - term2
-    result = float(crps_values.mean(dtype=np.float64))
+    result = float(crps_values.mean().item())
 
-    if not np.isfinite(result):
+    if not math.isfinite(result):
         raise ValueError("CRPS result is non-finite")
 
     return result

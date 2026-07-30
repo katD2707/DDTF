@@ -93,9 +93,9 @@ def evaluate(
             pred = revin(pred, mode="denorm")
         pred = rearrange(pred, "(b n) l c -> b n l c", n=num_samples)
 
-        all_preds.append(pred.mean(1).cpu())
-        all_targets.append(tgt.cpu())
-        all_samples.append(pred.cpu())
+        all_preds.append(pred.mean(1))
+        all_targets.append(tgt)
+        all_samples.append(pred)
 
     # timestep_losses = dict(timestep_losses)
 
