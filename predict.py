@@ -134,7 +134,7 @@ def run_evaluation(
     targets = torch.cat(all_targets, dim=0)
     candidates = torch.cat(all_samples, dim=0)
     metrics = compute_metrics(preds, targets, samples=candidates)
-    return metrics, preds.numpy(), targets.numpy()
+    return metrics, preds.detach().cpu().numpy(), targets.detach().cpu().numpy()
 
 
 def main():
