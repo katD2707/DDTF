@@ -23,6 +23,19 @@ def _smooth_1d_batch(x: torch.Tensor, window: int) -> torch.Tensor:
     kernel = torch.ones(1, 1, window, device=x.device, dtype=x.dtype) / window
     x = F.pad(x.unsqueeze(1), (pad, pad), mode="replicate")
     return F.conv1d(x, kernel).squeeze(1)
+    # Equivalent to F.pad(..., mode="replicate")
+    # left_pad = x[:, :1].expand(-1, pad)
+    # right_pad = x[:, -1:].expand(-1, pad)
+    # x_padded = torch.cat([left_pad, x, right_pad], dim=1)
+
+    # # [N, padded_T] -> [N, output_T, window]
+    # windows = x_padded.unfold(
+    #     dimension=1,
+    #     size=window,
+    #     step=1,
+    # )
+
+    # return windows.mean(dim=-1)
 
 
 def _segment_sse(n, sx, sy, sxx, sxy, syy, eps=1e-12):

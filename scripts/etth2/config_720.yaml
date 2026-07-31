@@ -21,12 +21,12 @@ model:
   d_model_encoder: 128
   n_encoder_layers: 2
 
-  d_model_denoiser: 256
+  d_model_denoiser: 128
   n_denoiser_layers: 4
 
   n_heads: 4
   mlp_ratio: 4
-  dropout: 0.5
+  dropout: 0.4
 
   # Diffusion
   num_diffusion_steps: 1000
@@ -76,6 +76,6 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-e2h128-d4h256-p0.5-l1_etth2_early_ber0.9_720
+  checkpoint_dir: checkpoints/normal-beta-e2h128-d4h128-p0.4-l1_etth2_early_720
   seed: 42
   device: auto              # auto | cpu | cuda

@@ -22,10 +22,10 @@ model:
   n_encoder_layers: 2
 
   d_model_denoiser: 128
-  n_denoiser_layers: 1
+  n_denoiser_layers: 2
 
   n_heads: 4
-  mlp_ratio: 1
+  mlp_ratio: 4
   dropout: 0.2
 
   # Diffusion
@@ -38,7 +38,7 @@ model:
 
 
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
-  bernoulli_sampling: true
+  bernoulli_sampling: false
   bernoulli_p: 0.9
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-d3-p0.4-l1_exchange_early_ber0.9_192
+  checkpoint_dir: checkpoints/normal-l1_exchange_early_192
   seed: 42
   device: auto              # auto | cpu | cuda
 

@@ -22,10 +22,10 @@ model:
   n_encoder_layers: 2
 
   d_model_denoiser: 128
-  n_denoiser_layers: 1
+  n_denoiser_layers: 2
 
   n_heads: 4
-  mlp_ratio: 1
+  mlp_ratio: 4
   dropout: 0.2
 
   # Diffusion
@@ -33,7 +33,7 @@ model:
   num_sampling_steps: 20
   noise_schedule: linear    # linear | cosine | quad | sigmoid
   beta_start: 0.0001
-  beta_end: 0.1
+  beta_end: 0.02
   eta: 1.0                  # DDIM eta; 0 = deterministic
 
 
@@ -58,7 +58,7 @@ training:
   amp_dtype: float16         # float16 or bfloat16
 
   # Training early stopping (patience-based on val MSE)
-  patience: 5                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
+  patience: 10                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
 
   # Resume from checkpoint
   resume: ""                 # path to epoch_N.pt checkpoint, empty = start fresh

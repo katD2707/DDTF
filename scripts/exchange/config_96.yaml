@@ -26,19 +26,19 @@ model:
 
   n_heads: 4
   mlp_ratio: 4
-  dropout: 0.4
+  dropout: 0.2
 
   # Diffusion
   num_diffusion_steps: 1000
   num_sampling_steps: 20
   noise_schedule: linear    # linear | cosine | quad | sigmoid
   beta_start: 0.0001
-  beta_end: 0.1
+  beta_end: 0.02
   eta: 1.0                  # DDIM eta; 0 = deterministic
 
 
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
-  bernoulli_sampling: true
+  bernoulli_sampling: false
   bernoulli_p: 0.9
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ training:
   amp_dtype: float16         # float16 or bfloat16
 
   # Training early stopping (patience-based on val MSE)
-  patience: 5                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
+  patience: 10                # 0 = disabled; e.g. 10 = stop after 10 eval cycles without improvement
 
   # Resume from checkpoint
   resume: ""                 # path to epoch_N.pt checkpoint, empty = start fresh
@@ -76,7 +76,7 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-p0.4-l1_exchange_early_ber0.9_96
+  checkpoint_dir: checkpoints/normal-l1_exchange_early_96
   seed: 42
   device: auto              # auto | cpu | cuda
 

@@ -30,8 +30,8 @@ def crps(samples: Tensor, target: Tensor) -> float:
     Returns:
         float: Mean CRPS value over all batch elements, timesteps, and channels.
     """
-    samples_double = samples.detach().to(dtype=torch.float64)
-    target_double = target.detach().to(dtype=torch.float64)
+    samples_double = samples.to(dtype=torch.float64)
+    target_double = target.to(dtype=torch.float64)
     num_samples = samples_double.shape[1]
 
     # First empirical CRPS term: E|X - y|

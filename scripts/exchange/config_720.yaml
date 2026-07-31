@@ -14,7 +14,7 @@ model:
   patch_size: 24
 
   # RevIN (instance normalization for distribution shift)
-  use_revin: false
+  use_revin: true
   revin_affine: false
   use_de_stationary: true
 
@@ -26,20 +26,19 @@ model:
 
   n_heads: 4
   mlp_ratio: 4
-  dropout: 0.4
+  dropout: 0.2
 
   # Diffusion
   num_diffusion_steps: 1000
   num_sampling_steps: 20
   noise_schedule: linear    # linear | cosine | quad | sigmoid
   beta_start: 0.0001
-  beta_end: 0.1
+  beta_end: 0.02
   eta: 1.0                  # DDIM eta; 0 = deterministic
-
 
   # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
   bernoulli_sampling: false
-  bernoulli_p: 0.7
+  bernoulli_p: 0.9
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
@@ -76,6 +75,6 @@ training:
   num_workers: 2
   eval_interval: 1
   save_interval: 10
-  checkpoint_dir: checkpoints/normal-norev-nh4-e2h128-d2h128-p0.4-l1_exchange_early_720
+  checkpoint_dir: checkpoints/normal-l1_exchange_early_720
   seed: 42
   device: auto              # auto | cpu | cuda

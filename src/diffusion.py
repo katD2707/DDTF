@@ -23,6 +23,58 @@ from src.early_stopping import find_global_early_stop
 from src.utils import default, extract
 
 
+def dft_forward_real_input(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Explicit DFT equivalent to:
+
+        fft = torch.fft.fft(x, dim=-1, norm="forward")
+        real = fft.real
+        imag = fft.imag
+
+    Args:
+        x: Real-valued tensor with shape [..., T].
+
+    Returns:
+        real: [..., T]
+        imag: [..., T]
+
+    Warning:
+        This implementation is O(T^2), whereas FFT is O(T log T).
+    """
+    if not x.is_floating_point():
+        raise TypeError("x must be a floating-point tensor")
+
+    length = x.size(-1)
+
+    # Construct angles in float32 for better CUDA compatibility,
+    # then convert the matrices to the input dtype.
+    index = torch.arange(
+        length,
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    # angle[k, n] = 2*pi*k*n/T
+    angle = (
+        2.0
+        * math.pi
+        * index[:, None]
+        * index[None, :]
+        / length
+    )
+
+    cosine = torch.cos(angle).to(dtype=x.dtype)
+    sine = torch.sin(angle).to(dtype=x.dtype)
+
+    # DFT:
+    # X[k] = (1/T) * sum_n x[n] * (cos(angle) - i*sin(angle))
+    real = torch.matmul(x, cosine.transpose(0, 1)) / length
+    imag = -torch.matmul(x, sine.transpose(0, 1)) / length
+
+    return real, imag
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Beta Schedule
 # ═════════════════════════════════════════════════════════════════════════════
@@ -227,8 +279,21 @@ class FFTDiffusion(nn.Module):
                         + loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
         denoise_loss +=  1.0 * fourier_loss
 
+        # fft1_real, fft1_imag = dft_forward_real_input(y0_pred.transpose(1, 2))
+        # fft2_real, fft2_imag = dft_forward_real_input(y_target.transpose(1, 2))
+
+        # fft1_real = fft1_real.transpose(1, 2)
+        # fft1_imag = fft1_imag.transpose(1, 2)
+
+        # fft2_real = fft2_real.transpose(1, 2)
+        # fft2_imag = fft2_imag.transpose(1, 2)
+
+        # fourier_loss = loss_fn(fft1_real, fft2_real, reduction='none') \
+        #                  + loss_fn(fft1_imag, fft2_imag, reduction='none')
+        # denoise_loss +=  1.0 * fourier_loss
+
         # Filter outliers
-        denoise_loss = denoise_loss.mean()
+        denoise_loss = denoise_loss[denoise_loss < 100].mean()
 
         return {
             "total": denoise_loss,
@@ -296,15 +361,18 @@ class FFTDiffusion(nn.Module):
             t_input = t_b.unsqueeze(1).expand(B_eff, eval_len)
             y0_pred = self.denoiser(y_t, t_input, cond, tau=tau, delta=delta)
             noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
-            all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> (b n c) l", n=num_samples))
+            # all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).detach().cpu().numpy())
             if return_scores:
                 if tgt is None:
-                    c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(2)
+                    c_avg = rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).mean(1)
                 else:
-                    c_avg = ((rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples)-tgt.unsqueeze(1))**2).mean(2)
-                all_scores.append(rearrange(c_avg, "b n c -> (b n c)"))
+                    c_avg = ((rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples)-tgt.unsqueeze(1))**2).mean(1)
+                all_scores.append(rearrange(c_avg, "b l c -> (b c) l").mean(-1))
                 all_steps.append(t_now)
 
+            # Early stopping
+            if not return_scores and stop_step is not None and t_now <= stop_step:
+                break
 
             if t_next < 0:
                 # np.savez('cand_all', np.stack(all_cand_scores, axis=1))
@@ -316,19 +384,10 @@ class FFTDiffusion(nn.Module):
             c_coef = (1 - alpha_s - sigma ** 2).sqrt()
             y_t = y0_pred * alpha_s.sqrt() + c_coef * noise_pred + sigma * torch.randn_like(y_t)
 
-        scores = torch.stack(all_scores, dim=1)
-        steps = torch.tensor(all_steps, device=y0_pred.device, dtype=torch.float)
-        es = find_global_early_stop(
-            scores=scores, steps=steps,
-            smooth_window=None,
-            min_frac=0.1,
-            safety_margin=0,
-        )
-        y0_pred_steps = torch.stack(all_cand_scores, dim=1)     # [BNC, T, L]
-        y0_pred = y0_pred_steps[torch.arange(y0_pred_steps.shape[0], device=y0_pred.device), es["sample_stop_indices"]]
-        y0_pred = rearrange(y0_pred, "(b n c) l -> (b n) l c", n=num_samples, c=C)
         if return_scores:
-            return y0_pred, scores, steps
+            scores = torch.stack(all_scores, dim=1)
+            steps_t = torch.tensor(all_steps, device=y0_pred.device, dtype=torch.float)
+            return y0_pred, scores, steps_t
         return y0_pred
 
     # ── Factory ───────────────────────────────────────────────────────────

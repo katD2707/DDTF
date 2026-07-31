@@ -14,6 +14,66 @@ import torch.nn as nn
 from torch import Tensor
 from typing import List
 
+class CircularConv1dKernel3(nn.Module):
+    """
+    Equivalent to:
+
+    nn.Conv1d(
+        in_channels=in_channels,
+        out_channels=1,
+        kernel_size=3,
+        padding=1,
+        padding_mode="circular",
+        bias=False,
+    )
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+
+        # Same weight shape as nn.Conv1d:
+        # [out_channels=1, in_channels, kernel_size=3]
+        self.weight = nn.Parameter(
+            torch.empty(1, in_channels, 3)
+        )
+
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, in_channels, sequence_length]
+        output: [batch_size, 1, sequence_length]
+        """
+        if x.ndim != 3:
+            raise ValueError(
+                f"Expected x with shape [B, C, L], got {tuple(x.shape)}"
+            )
+
+        if x.shape[1] != self.weight.shape[1]:
+            raise ValueError(
+                f"Expected {self.weight.shape[1]} channels, "
+                f"got {x.shape[1]}"
+            )
+
+        # Circular neighbors:
+        # x_left[..., t]   = x[..., t - 1]
+        # x_center[..., t] = x[..., t]
+        # x_right[..., t]  = x[..., t + 1]
+        x_left = torch.roll(x, shifts=1, dims=-1)
+        x_right = torch.roll(x, shifts=-1, dims=-1)
+
+        w_left = self.weight[0, :, 0].view(1, -1, 1)
+        w_center = self.weight[0, :, 1].view(1, -1, 1)
+        w_right = self.weight[0, :, 2].view(1, -1, 1)
+
+        output = (
+            x_left * w_left
+            + x * w_center
+            + x_right * w_right
+        ).sum(dim=1, keepdim=True)
+
+        return output
+
 class Projector(nn.Module):
     """
     MLP projector that learns tau (scale) and delta (shift) factors
@@ -26,6 +86,7 @@ class Projector(nn.Module):
         super().__init__()
         # Input: [mean (C) | std (C)] concatenated, total 2*C dimensions
         self.series_conv = nn.Conv1d(in_channels=seq_len, out_channels=1, kernel_size=3, padding=1, padding_mode='circular', bias=False)
+        # self.series_conv = CircularConv1dKernel3(seq_len)
         layers = [nn.Linear(2, hidden_dims[0]), nn.ReLU()]
         for i in range(hidden_layers - 1):
             layers += [nn.Linear(hidden_dims[i], hidden_dims[i+1]), nn.ReLU()]
