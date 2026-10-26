@@ -211,6 +211,19 @@ class FFTDiffusion(nn.Module):
             return (t < stop_step).long()
         return torch.full_like(t, self.PRED_X_START)
 
+    def _train_pred_type_for(self, t: Tensor, stop_step: Optional[float]) -> Tensor:
+        """Training-time prediction target for timesteps t [B].
+
+        In mixed mode each sample is trained on noise with probability
+        r = stop_step / T if t < stop_step, else 1 - r; otherwise x_start.
+        Other modes (and mixed before calibration) match ``_pred_type_for``.
+        """
+        if self.prediction_type != "mixed" or stop_step is None:
+            return self._pred_type_for(t, stop_step)
+        r = float(stop_step) / self.num_diffusion_steps
+        p_noise = torch.where(t < stop_step, r, 1.0 - r)
+        return torch.bernoulli(p_noise).long()
+
     def q_sample(self, y0: Tensor, t: Tensor, noise: Optional[Tensor] = None) -> Tensor:
         """
         Forward diffusion: add noise to the clean signal.
@@ -240,7 +253,7 @@ class FFTDiffusion(nn.Module):
         Training step.
 
         Each sample's target (x_start or noise) is chosen from its timestep
-        via ``_pred_type_for`` and all samples go through one denoiser pass.
+        via ``_train_pred_type_for`` and all samples go through one denoiser pass.
         """
         B, _, C = y.shape
         device = y.device
@@ -252,7 +265,7 @@ class FFTDiffusion(nn.Module):
             0, self.num_diffusion_steps, (B,), device=device)
         y_target = y
         t = t_scalar.unsqueeze(1).expand(B, self.max_prediction_length)
-        pred_type = self._pred_type_for(t_scalar, self._stop_step)  # [B]
+        pred_type = self._train_pred_type_for(t_scalar, self._stop_step)  # [B]
 
         # ── Add Gaussian noise ────────────────────────────────────────────
         noise = torch.randn_like(y_target)
