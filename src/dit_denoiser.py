@@ -1,8 +1,8 @@
 """
 Simplified DiT-style denoiser for FFT diffusion.
 
-Predicts clean signal y_0 and degradation delta_t from noisy input,
-conditioned on encoded context and diffusion timestep.
+Predicts clean signal y_0 or noise eps from noisy input, conditioned on
+encoded context, diffusion timestep, and a prediction-type indicator.
 """
 
 import math
@@ -67,8 +67,6 @@ class AdaLNBlock(nn.Module):
         c: Tensor,
         ctx: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
-        tau: Optional[Tensor] = None,
-        delta: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
@@ -76,14 +74,10 @@ class AdaLNBlock(nn.Module):
             c:         [B, L, D]   per-patch adaLN condition (timestep embedding)
             ctx:       [B, S, D]   cross-attention context (history encoder)
             attn_mask: unused, kept for interface compatibility
-            tau:       [B, 1]   optional de-stationary parameter
-            delta:     [B, L]   optional de-stationary parameter
         """
         B, L, D = x.shape
         shift_ca, scale_ca, gate_ca, shift_mlp, scale_mlp, gate_mlp = \
             self.adaLN(c).chunk(6, dim=-1)
-        tau = 1.0 if tau is None else tau.reshape(B, 1, 1, 1)  # reshape for broadcasting
-        delta = 0.0 if delta is None else delta.reshape(B, 1, 1, -1)  # reshape for broadcasting
 
         # ── Cross-attention to history encoder (SDPA) ──────────────────────
         h     = modulate(self.norm1(x), shift_ca, scale_ca)
@@ -95,10 +89,7 @@ class AdaLNBlock(nn.Module):
         
         # Compute attention scores: [B, H, L, S]
         scores = torch.einsum("...ld,...sd->...ls", q, k) / math.sqrt(self.head_dim)
-        
-        # Apply de-stationary factors if provided (pre-softmax)
-        scores = scores * tau + delta
-        
+
         # Softmax and dropout
         attn_weights = torch.softmax(scores, dim=-1)
         if self.training:
@@ -158,6 +149,8 @@ class DiTDenoiser(nn.Module):
         self.n_heads = n_heads
 
         self.timestep_emb = TimestepEmbedding(d_model, patching=True, patch_size=patch_size)
+        # Prediction-target indicator: 0 = x_start, 1 = noise
+        self.pred_type_emb = nn.Embedding(2, d_model)
         self.context_proj = nn.Linear(d_model_condition, d_model) if d_model_condition != d_model else nn.Identity()
 
         self.patch_embedding = PatchEmbedding(patch_size, d_model)
@@ -186,6 +179,7 @@ class DiTDenoiser(nn.Module):
             nn.init.normal_(self.context_proj.weight, std=0.02)
         nn.init.normal_(self.timestep_emb.mlp[0].weight, std=0.02)
         nn.init.normal_(self.timestep_emb.mlp[2].weight, std=0.02)
+        nn.init.normal_(self.pred_type_emb.weight, std=0.02)
         for block in self.blocks:
             nn.init.zeros_(block.adaLN[-1].weight)
             nn.init.zeros_(block.adaLN[-1].bias)
@@ -200,31 +194,33 @@ class DiTDenoiser(nn.Module):
         input: Tensor,
         t: Tensor,
         cond: Tensor,
-        tau: Optional[Tensor] = None,
-        delta: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        pred_type: Optional[Tensor] = None,
+    ) -> Tensor:
         """
         Args:
             input:       [B, L, C]  noisy prediction sequence
             t:           [B, L]  per-position timesteps
             cond:        [B, C, P_ctx, D_cond]  encoder output
-            tau, delta:  optional pre-computed de-stationary parameters
+            pred_type:   [B] long, 0 = predict x_start, 1 = predict noise
+                         (None → all x_start)
         Returns:
-            y0_pred: [B, L, C]
+            pred: [B, L, C]  y_0 or eps depending on pred_type
         """
         B, L, C = input.shape
 
+        if pred_type is None:
+            pred_type = torch.zeros(B, dtype=torch.long, device=input.device)
         t_rep = repeat(t, "b l -> (b c) l", c=C)
-        tau = rearrange(tau, "b 1 c -> (b c) 1") if tau is not None else None
-        delta = rearrange(delta, "b l c -> (b c) l") if delta is not None else None
+        pred_type_rep = repeat(pred_type, "b -> (b c)", c=C)
 
         h = self.patch_embedding(input)  # [B*C, P_in, D]
         h = h + self.positional_embedding(h)
         c = self.timestep_emb(t_rep)    # [B*C, P_in, D]
+        c = c + self.pred_type_emb(pred_type_rep).unsqueeze(1)
 
         cond_emb = self.context_proj(rearrange(cond, "b c p d -> (b c) p d"))
         for block in self.blocks:
-            h = block(h, c, cond_emb, tau=tau, delta=delta)
+            h = block(h, c, cond_emb)
 
         y0_out = self.final_layer(h, c).flatten(-2)
 

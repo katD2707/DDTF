@@ -67,12 +67,11 @@ def evaluate(
     for ctx, tgt in loader:
         ctx, tgt = ctx.to(device), tgt.to(device)
 
-        tau, delta = None, None
         if revin is not None:
-            ctx, tau, delta = revin(ctx, mode="norm")
-            norm_tgt, _, _ = revin(tgt, mode="norm", reuse_stats=True)
+            ctx = revin(ctx, mode="norm")
+            norm_tgt = revin(tgt, mode="norm", reuse_stats=True)
 
-        # loss_dict = model(norm_tgt, ctx, tau, delta) if revin is not None else model(norm_tgt, ctx)
+        # loss_dict = model(norm_tgt, ctx)
         # loss = loss_dict["total"]
         # for loss, t in zip(
         #     loss_dict['step_loss'].tolist(),
@@ -81,8 +80,7 @@ def evaluate(
         #     timestep_losses[int(t)].append(float(loss))
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                             eval_prediction_length=eval_length,
-                             tau=tau, delta=delta)
+                             eval_prediction_length=eval_length)
         # np.savez('source', ctx.detach().cpu().numpy())
         # np.savez('target', norm_tgt.detach().cpu().numpy())
 
@@ -135,20 +133,15 @@ def parse_args():
     parser.add_argument("--mlp_ratio", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--use_revin", action="store_true", default=None)
-    parser.add_argument("--use_de_stationary", action="store_true", default=None,
-                        help="Enable learned de-stationary projector (tau/delta)")
     parser.add_argument("--num_diffusion_steps", type=int, default=None)
     parser.add_argument("--num_sampling_steps", type=int, default=None)
     parser.add_argument("--noise_schedule", type=str, default=None)
     parser.add_argument("--beta_start", type=float, default=None)
     parser.add_argument("--beta_end", type=float, default=None)
     parser.add_argument("--eta", type=float, default=None)
-
-    # Bernoulli timestep sampling
-    parser.add_argument("--bernoulli_sampling", action="store_true", default=None,
-                        help="Enable Bernoulli-gated non-uniform timestep sampling")
-    parser.add_argument("--bernoulli_p", type=float, default=None,
-                        help="Bernoulli probability for high-noise interval (default: 0.7)")
+    parser.add_argument("--prediction_type", type=str, default=None,
+                        choices=["x_start", "noise", "mixed"],
+                        help="Denoiser target; mixed = noise below stop_step, x_start above")
 
     # Training overrides
     parser.add_argument("--learning_rate", type=float, default=None)
@@ -203,6 +196,10 @@ def main():
 
     set_seed(tcfg.seed)
 
+    if mcfg.prediction_type == "mixed" and not tcfg.use_early_stop:
+        raise ValueError("prediction_type='mixed' requires use_early_stop=true "
+                         "(the x_start/noise switch point is the calibrated stop_step)")
+
     # Device
     if tcfg.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -238,9 +235,7 @@ def main():
     # ── RevIN ─────────────────────────────────────────────────────────────
     revin = None
     if mcfg.use_revin:
-        revin = RevIN(num_features=mcfg.num_features, in_len=mcfg.context_length, out_len=model.condition_encoder.num_patches,
-                      affine=mcfg.revin_affine, use_de_stationary=mcfg.use_de_stationary,
-                      p_hidden_dims=mcfg.p_hidden_dims, p_hidden_layers=mcfg.p_hidden_layers).to(device)
+        revin = RevIN(num_features=mcfg.num_features, affine=mcfg.revin_affine).to(device)
         print("RevIN enabled")
 
     # ── Optimizer & Scheduler ─────────────────────────────────────────────
@@ -293,6 +288,7 @@ def main():
             start_epoch = ckpt.get("epoch", 0) + 1
             best_val_mse = ckpt.get("best_val_mse", float("inf"))
             global_step = ckpt.get("global_step", 0)
+            model._stop_step = ckpt.get("stop_step")
             print(f"  Resumed at epoch {start_epoch}, best_val_mse={best_val_mse:.6f}")
         else:
             print(f"Warning: resume path '{tcfg.resume}' not found, starting fresh")
@@ -318,13 +314,13 @@ def main():
 
             # RevIN: normalize context and target for training
             if revin is not None:
-                ctx, tau, delta = revin(ctx, mode="norm")
-                tgt, _, _ = revin(tgt, mode="norm", reuse_stats=True)
+                ctx = revin(ctx, mode="norm")
+                tgt = revin(tgt, mode="norm", reuse_stats=True)
 
             optimizer.zero_grad()
 
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss_dict = model(tgt, ctx, tau, delta) if revin is not None else model(tgt, ctx)
+                loss_dict = model(tgt, ctx)
                 loss = loss_dict["total"]
 
             if amp_enabled:
@@ -364,11 +360,10 @@ def main():
                 while pilot_eval_count < tcfg.num_pilot_samples:
                     pilot_ctx, _ = next(test_dtl)
                     pilot_ctx = pilot_ctx[:min(tcfg.test_batch_size, tcfg.num_pilot_samples-pilot_eval_count)].to(device)
-                    tau, delta = None, None
                     if revin is not None:
-                        pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+                        pilot_ctx = revin(pilot_ctx, mode="norm")
                     _, scores, steps = model.sample(
-                        pilot_ctx, num_samples=tcfg.num_samples, return_scores=True, tau=tau, delta=delta,
+                        pilot_ctx, num_samples=tcfg.num_samples, return_scores=True,
                     )
                     pilot_eval_count += tcfg.test_batch_size
                     all_scores.append(scores)
@@ -381,9 +376,8 @@ def main():
                 )
                 stop_step = es_result["stop_step"]
                 print(f"  ↳ Early stop calibrated: stop_step={stop_step}")
-                # Feed t_delta for Bernoulli timestep sampling
-                if stop_step is not None:
-                    model._t_delta = int(stop_step)
+                # Mixed mode: train noise prediction for t < stop_step from now on
+                model._stop_step = stop_step
 
             metrics = evaluate(model, val_loader, device, revin=revin,
                                num_samples=tcfg.num_samples, stop_step=stop_step,
@@ -398,6 +392,7 @@ def main():
                     "epoch": epoch,
                     "global_step": global_step,
                     "best_val_mse": best_val_mse,
+                    "stop_step": model._stop_step,
                     "model": model.state_dict(),
                     "config": cfg.to_dict(),
                 }
@@ -419,6 +414,7 @@ def main():
                 "epoch": epoch,
                 "global_step": global_step,
                 "best_val_mse": best_val_mse,
+                "stop_step": model._stop_step,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "config": cfg.to_dict(),
@@ -448,11 +444,10 @@ def main():
         while pilot_eval_count < tcfg.num_pilot_samples:
             pilot_ctx, _ = next(test_dtl)
             pilot_ctx = pilot_ctx[:min(tcfg.test_batch_size, tcfg.num_pilot_samples-pilot_eval_count)].to(device)
-            tau, delta = None, None
             if revin is not None:
-                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+                pilot_ctx = revin(pilot_ctx, mode="norm")
             _, scores, steps = model.sample(
-                pilot_ctx, num_samples=tcfg.num_samples, return_scores=True, tau=tau, delta=delta,
+                pilot_ctx, num_samples=tcfg.num_samples, return_scores=True,
             )
             pilot_eval_count += tcfg.test_batch_size
             all_scores.append(scores)
@@ -465,9 +460,6 @@ def main():
         )
         stop_step = es_result["stop_step"]
         print(f"Early stop calibrated: stop_step={stop_step}")
-        # Feed t_delta for Bernoulli timestep sampling (test-time calibration)
-        if stop_step is not None:
-            model._t_delta = int(stop_step)
 
     test_metrics = evaluate(model, test_loader, device, revin=revin,
                             num_samples=tcfg.num_samples, stop_step=stop_step,

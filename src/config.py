@@ -60,11 +60,6 @@ class ModelConfig:
     # Common
     dropout: float = 0.1
 
-    # De-stationary (learned projector for tau/delta)
-    use_de_stationary: bool = False
-    p_hidden_dims: List[int] = field(default_factory=lambda: [128, 128])
-    p_hidden_layers: int = 2
-
     # Diffusion (FFT-based f-DM)
     num_diffusion_steps: int = 50
     num_sampling_steps: int = 10
@@ -73,13 +68,13 @@ class ModelConfig:
     noise_schedule: Literal["linear", "cosine", "quad", "sigmoid", "exp"] = "linear"
     eta: float = 1.0  # DDIM eta
 
-    # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
-    # When enabled, training timesteps are sampled non-uniformly via a
-    # Bernoulli gate: with prob p sample from [t_delta, T-1] (high-noise),
-    # with prob 1-p sample from [1, t_delta] (low-noise).
-    # t_delta is derived dynamically from the early-stopping stop_step.
-    bernoulli_sampling: bool = False
-    bernoulli_p: float = 0.7
+    # Denoiser target.
+    #   x_start: predict y_0 at every timestep
+    #   noise:   predict eps at every timestep
+    #   mixed:   predict eps for t < stop_step, y_0 for t >= stop_step;
+    #            stop_step comes from early-stopping calibration and an
+    #            indicator embedding tells the denoiser which target to output.
+    prediction_type: Literal["x_start", "noise", "mixed"] = "x_start"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Training

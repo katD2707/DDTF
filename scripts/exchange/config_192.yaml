@@ -16,7 +16,6 @@ model:
   # RevIN (instance normalization for distribution shift)
   use_revin: true
   revin_affine: false
-  use_de_stationary: true
 
   d_model_encoder: 128
   n_encoder_layers: 2
@@ -37,9 +36,8 @@ model:
   eta: 1.0                  # DDIM eta; 0 = deterministic
 
 
-  # Bernoulli timestep sampling (DDPM-BS, Zheng et al. 2024)
-  bernoulli_sampling: false
-  bernoulli_p: 0.9
+  # Denoiser target; mixed = noise for t < stop_step, x_start above (needs use_early_stop)
+  prediction_type: mixed   # x_start | noise | mixed
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:

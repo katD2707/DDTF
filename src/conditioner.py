@@ -29,18 +29,13 @@ class ConditionBlock(nn.Module):
             nn.Dropout(dropout), nn.Linear(mlp_hidden, d_model), nn.Dropout(dropout),
         )
 
-    def forward(self, x: Tensor, tau = None, delta = None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         B, L, D = x.shape
         # self-attention
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         scale = self.head_dim ** -0.5
         attn = torch.einsum("...ld,...sd->...ls", q, k) * scale
-
-        # apply de-stationary modulation if provided
-        tau = 1.0 if tau is None else tau.view(B, 1, 1, 1)  # [B, 1, 1, 1]
-        delta = 0.0 if delta is None else delta.view(B, 1, 1, L)  # [B, 1, 1, L]
-        attn = attn * tau + delta
 
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
@@ -76,23 +71,19 @@ class ConditionEncoder(nn.Module):
             for _ in range(n_layers)
         ])
 
-    def forward(self, x: Tensor, tau: Tensor = None, delta: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         """
         Args:
             x:     [B, context_len, C]
-            tau:   [B, 1, C] optional pre-computed tau (if None, computed from x)
-            delta: [B, L, C] optional pre-computed delta (if None, computed from x)
         Returns:
-            [B, C, num_patches, d_model], tau, delta
+            [B, C, num_patches, d_model]
         """
         B, L, C = x.shape
         x = rearrange(x, "b l c -> (b c) l")       # [B*C, L]
-        tau = rearrange(tau, "b 1 c -> (b c) 1") if tau is not None else None  # [B*C, 1]
-        delta = rearrange(delta, "b l c -> (b c) l") if delta is not None else None  # [B*C, L]
         h = self.patch_emb(x)                      # [B*C, P, D]
         h = h + self.pos_emb(h)
 
         for block in self.blocks:
-            h = block(h, tau=tau, delta=delta)
+            h = block(h)
         h = rearrange(h, "(b c) p d -> b c p d", b=B, c=C)
         return h

@@ -1,8 +1,9 @@
 """
 Diffusion model for time series forecasting.
 
-Implements a standard DDPM/DDIM diffusion process for time series,
-with optional Bernoulli-gated non-uniform timestep sampling.
+Implements a standard DDPM/DDIM diffusion process for time series.
+The denoiser predicts x_start, noise, or a mix of both (noise below the
+early-stopping step, x_start above it).
 """
 
 import math
@@ -115,9 +116,12 @@ class FFTDiffusion(nn.Module):
 
     Combines:
       - ConditionEncoder  (encodes historical context)
-      - Denoiser          (DiT-style, predicts y_0)
+      - Denoiser          (DiT-style, predicts y_0 and/or eps)
       - Standard DDPM/DDIM diffusion schedule
     """
+
+    PRED_X_START = 0
+    PRED_NOISE = 1
 
     def __init__(
         self,
@@ -137,19 +141,19 @@ class FFTDiffusion(nn.Module):
         beta_end: float = 0.1,
         noise_schedule: str = "linear",
         eta: float = 1.0,
-        bernoulli_sampling: bool = False,
-        bernoulli_p: float = 0.7,
+        prediction_type: str = "x_start",
     ):
         super().__init__()
+        assert prediction_type in ("x_start", "noise", "mixed"), \
+            f"Unknown prediction_type: {prediction_type}"
         self.context_length = context_length
         self.max_prediction_length = max_prediction_length
         self.num_diffusion_steps = num_diffusion_steps
         self.num_sampling_steps = num_sampling_steps
         self.eta = eta
         self.patch_size = patch_size
-        self.bernoulli_sampling = bernoulli_sampling
-        self.bernoulli_p = bernoulli_p
-        self._t_delta: Optional[int] = None  # set dynamically from stop_step
+        self.prediction_type = prediction_type
+        self._stop_step: Optional[float] = None  # set dynamically by the training loop (mixed mode)
 
         # Sub-modules
         self.condition_encoder = ConditionEncoder(
@@ -193,31 +197,19 @@ class FFTDiffusion(nn.Module):
         reg("post_coef1", betas * ac_prev.sqrt() / (1 - ac))
         reg("post_coef2", (1 - ac_prev) * alphas.sqrt() / (1 - ac))
 
-    # ── Bernoulli timestep sampling ──────────────────────────────────────────
+    # ── Prediction-type helpers ──────────────────────────────────────────
 
-    def _sample_timestep_bernoulli(self, batch_size: int, device) -> Tensor:
-        """Bernoulli-gated non-uniform timestep sampling (flipped ranges).
+    def _pred_type_for(self, t: Tensor, stop_step: Optional[float]) -> Tensor:
+        """Per-sample prediction target (PRED_X_START / PRED_NOISE) for timesteps t [B].
 
-        Adapted from DDPM-BS (Zheng et al., ACM MM 2024) with flipped
-        interval assignment:
-          - With prob p:   t ~ Uniform[t_delta, T-1]   (high-noise)
-          - With prob 1-p: t ~ Uniform[1, t_delta]     (low-noise)
-
-        ``_t_delta`` is derived from the early-stopping stop_step and
-        updated externally by the training loop after each evaluation.
+        In mixed mode, t < stop_step uses noise prediction and t >= stop_step
+        uses x_start prediction; without a stop_step everything is x_start.
         """
-        T = self.num_diffusion_steps
-        t_delta = self._t_delta  # guaranteed not None by caller
-
-        u = torch.rand(batch_size, device=device)
-
-        # High-noise branch: [t_delta, T-1]
-        t_high = torch.randint(t_delta, T, (batch_size,), device=device)
-        # Low-noise branch: [0, t_delta]  (inclusive, so upper bound is t_delta + 1 for randint)
-        t_low = torch.randint(0, t_delta, (batch_size,), device=device)
-
-        t = torch.where(u <= self.bernoulli_p, t_high, t_low)
-        return t
+        if self.prediction_type == "noise":
+            return torch.full_like(t, self.PRED_NOISE)
+        if self.prediction_type == "mixed" and stop_step is not None:
+            return (t < stop_step).long()
+        return torch.full_like(t, self.PRED_X_START)
 
     def q_sample(self, y0: Tensor, t: Tensor, noise: Optional[Tensor] = None) -> Tensor:
         """
@@ -238,46 +230,54 @@ class FFTDiffusion(nn.Module):
     def _noise_from_y0(self, yt, t, y0):
         return (extract(self.sqrt_recip_ac, t, yt.shape) * yt - y0) / extract(self.sqrt_recipm1_ac, t, yt.shape)
 
+    def _y0_from_noise(self, yt, t, noise):
+        return extract(self.sqrt_recip_ac, t, yt.shape) * yt - extract(self.sqrt_recipm1_ac, t, yt.shape) * noise
+
     # ── Training forward ─────────────────────────────────────────────────
 
-    def forward(self, y: Tensor, context: Tensor, tau: Optional[Tensor] = None, delta: Optional[Tensor] = None):
+    def forward(self, y: Tensor, context: Tensor):
         """
         Training step.
+
+        Each sample's target (x_start or noise) is chosen from its timestep
+        via ``_pred_type_for`` and all samples go through one denoiser pass.
         """
         B, _, C = y.shape
         device = y.device
 
-        cond = self.condition_encoder(context, tau=tau, delta=delta)
+        cond = self.condition_encoder(context)
 
         # ── Timestep sampling ───────────────────────
-        _use_bernoulli = (self.bernoulli_sampling and self._t_delta is not None)
-        if _use_bernoulli:
-            t_scalar = self._sample_timestep_bernoulli(B, device)
-        else:
-            t_scalar = torch.randint(
-                0, self.num_diffusion_steps, (B,), device=device)
+        t_scalar = torch.randint(
+            0, self.num_diffusion_steps, (B,), device=device)
         y_target = y
         t = t_scalar.unsqueeze(1).expand(B, self.max_prediction_length)
+        pred_type = self._pred_type_for(t_scalar, self._stop_step)  # [B]
 
         # ── Add Gaussian noise ────────────────────────────────────────────
-        y_t = self.q_sample(y_target, t)
+        noise = torch.randn_like(y_target)
+        y_t = self.q_sample(y_target, t, noise)
         y_input = y_t
         t_input = t
 
         # ── Main denoiser forward ─────────────────────────────────────────
         loss_fn = F.l1_loss
-        y0_pred = self.denoiser(y_input, t_input, cond, tau=tau, delta=delta)
-        
-        # Losses
-        denoise_loss = loss_fn(y0_pred, y_target, reduction="none")
-        denoise_loss_cp = denoise_loss.detach().mean((1,2)).cpu()
+        pred = self.denoiser(y_input, t_input, cond, pred_type=pred_type)
 
-        fft1 = torch.fft.fft(y0_pred.transpose(1, 2), norm='forward')
+        # x_start loss: L1 + Fourier L1 against y_0
+        x0_loss = loss_fn(pred, y_target, reduction="none")
+        fft1 = torch.fft.fft(pred.transpose(1, 2), norm='forward')
         fft2 = torch.fft.fft(y_target.transpose(1, 2), norm='forward')
         fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
         fourier_loss = loss_fn(torch.real(fft1), torch.real(fft2), reduction='none') \
                         + loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-        denoise_loss +=  1.0 * fourier_loss
+
+        # noise loss: L1 against eps
+        eps_loss = loss_fn(pred, noise, reduction="none")
+
+        is_noise = (pred_type == self.PRED_NOISE).view(B, 1, 1)
+        denoise_loss_cp = torch.where(is_noise, eps_loss, x0_loss).detach().mean((1, 2)).cpu()
+        denoise_loss = torch.where(is_noise, eps_loss, x0_loss + 1.0 * fourier_loss)
 
         # fft1_real, fft1_imag = dft_forward_real_input(y0_pred.transpose(1, 2))
         # fft2_real, fft2_imag = dft_forward_real_input(y_target.transpose(1, 2))
@@ -311,8 +311,6 @@ class FFTDiffusion(nn.Module):
         num_samples: int = 1,
         stop_step: Optional[int] = None,
         return_scores: bool = False,
-        tau: Optional[Tensor] = None,
-        delta: Optional[Tensor] = None,
         tgt: Optional[Tensor] = None,
     ):
         """
@@ -324,7 +322,9 @@ class FFTDiffusion(nn.Module):
                                     ≤ max_prediction_length (training length).
                                     Defaults to the training prediction_length.
             num_samples:            ensemble size
-            stop_step:              if set, stop full-mode sampling at this t
+            stop_step:              x_start / noise mode: stop sampling at this t.
+                                    mixed mode: switch from x_start to noise
+                                    prediction below this t and run to the end.
             return_scores:          if True, return (pred, scores, steps)
         Returns:
             predictions [B, N, eval_len, C]  (or tuple when return_scores=True)
@@ -338,11 +338,9 @@ class FFTDiffusion(nn.Module):
             f"eval_prediction_length ({eval_len}) exceeds "
             f"max_prediction_length ({self.max_prediction_length})")
 
-        cond = self.condition_encoder(context, tau=tau, delta=delta)
+        cond = self.condition_encoder(context)
         if num_samples > 1:
             cond = repeat(cond, "b c p d -> (b n) c p d", n=num_samples)
-            tau = repeat(tau, "b 1 c -> (b n) 1 c", n=num_samples) if tau is not None else None
-            delta = repeat(delta, "b l c -> (b n) l c", n=num_samples) if delta is not None else None
 
         B_eff = B_orig * num_samples
         y_t = torch.randn(B_eff, eval_len, C, device=device)
@@ -359,8 +357,14 @@ class FFTDiffusion(nn.Module):
             t_nb = torch.full((B_eff,), t_next, device=device, dtype=torch.long)
 
             t_input = t_b.unsqueeze(1).expand(B_eff, eval_len)
-            y0_pred = self.denoiser(y_t, t_input, cond, tau=tau, delta=delta)
-            noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
+            pred_type = self._pred_type_for(t_b, stop_step)
+            pred = self.denoiser(y_t, t_input, cond, pred_type=pred_type)
+            if pred_type[0].item() == self.PRED_NOISE:
+                noise_pred = pred
+                y0_pred = self._y0_from_noise(y_t, t_b, noise_pred)
+            else:
+                y0_pred = pred
+                noise_pred = self._noise_from_y0(y_t, t_b, y0_pred)
             # all_cand_scores.append(rearrange(y0_pred, "(b n) l c -> b n l c", n=num_samples).detach().cpu().numpy())
             if return_scores:
                 if tgt is None:
@@ -370,8 +374,9 @@ class FFTDiffusion(nn.Module):
                 all_scores.append(rearrange(c_avg, "b l c -> (b c) l").mean(-1))
                 all_steps.append(t_now)
 
-            # Early stopping
-            if not return_scores and stop_step is not None and t_now <= stop_step:
+            # Early stopping (mixed mode keeps sampling with the noise head instead)
+            if (self.prediction_type != "mixed" and not return_scores
+                    and stop_step is not None and t_now <= stop_step):
                 break
 
             if t_next < 0:
@@ -411,6 +416,5 @@ class FFTDiffusion(nn.Module):
             beta_end=cfg.beta_end,
             noise_schedule=cfg.noise_schedule,
             eta=cfg.eta,
-            bernoulli_sampling=getattr(cfg, "bernoulli_sampling", False),
-            bernoulli_p=getattr(cfg, "bernoulli_p", 0.7),
+            prediction_type=getattr(cfg, "prediction_type", "x_start"),
         )

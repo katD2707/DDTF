@@ -81,12 +81,7 @@ def load_from_checkpoint(checkpoint_path: str, device: torch.device):
     if mcfg.use_revin and "revin" in ckpt:
         revin = RevIN(
             num_features=mcfg.num_features,
-            in_len=mcfg.context_length,
-            out_len=model.condition_encoder.num_patches,
             affine=mcfg.revin_affine,
-            use_de_stationary=mcfg.use_de_stationary,
-            p_hidden_dims=mcfg.p_hidden_dims,
-            p_hidden_layers=mcfg.p_hidden_layers,
         ).to(device)
         revin.load_state_dict(ckpt["revin"], strict=False)
 
@@ -111,13 +106,11 @@ def run_evaluation(
     for ctx, tgt in loader:
         ctx, tgt = ctx.to(device), tgt.to(device)
 
-        tau, delta = None, None
         if revin is not None:
-            ctx, tau, delta = revin(ctx, mode="norm")
+            ctx = revin(ctx, mode="norm")
 
         pred = model.sample(ctx, num_samples=num_samples, stop_step=stop_step,
-                            eval_prediction_length=eval_length,
-                            tau=tau, delta=delta)
+                            eval_prediction_length=eval_length)
 
         if revin is not None:
             # RevIN stats are [B, 1, C]; repeat to [B*N, 1, C] for all ensemble members
@@ -162,6 +155,9 @@ def main():
         mcfg.prediction_length = args.prediction_length
     if args.num_sampling_steps is not None:
         model.num_sampling_steps = args.num_sampling_steps
+    if model.prediction_type == "mixed" and not args.use_auto_stop:
+        print("Warning: prediction_type='mixed' without --use_auto_stop samples "
+              "with the x_start head only (no stop_step to switch at)")
 
     # ── Data ──────────────────────────────────────────────────────────────
     train_ds, val_ds, test_ds = load_csv_dataset(
@@ -192,11 +188,10 @@ def main():
         while pilot_eval_count < args.num_pilot_samples:
             pilot_ctx, _ = next(test_dtl)
             pilot_ctx = pilot_ctx[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
-            tau, delta = None, None
             if revin is not None:
-                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
+                pilot_ctx = revin(pilot_ctx, mode="norm")
             _, scores, steps = model.sample(
-                pilot_ctx, num_samples=args.num_samples, return_scores=True, tau=tau, delta=delta,
+                pilot_ctx, num_samples=args.num_samples, return_scores=True,
             )
             pilot_eval_count += args.batch_size
             all_scores.append(scores)
@@ -222,12 +217,11 @@ def main():
             pilot_ctx, pilot_tgt = next(test_dtl)
             pilot_ctx = pilot_ctx[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
             pilot_tgt = pilot_tgt[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
-            tau, delta = None, None
             if revin is not None:
-                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
-                pilot_tgt, _, _ = revin(pilot_tgt, mode="norm", reuse_stats=True)
+                pilot_ctx = revin(pilot_ctx, mode="norm")
+                pilot_tgt = revin(pilot_tgt, mode="norm", reuse_stats=True)
             _, scores, steps = model.sample(
-                pilot_ctx, num_samples=args.num_samples, return_scores=True, tau=tau, delta=delta, tgt=pilot_tgt,
+                pilot_ctx, num_samples=args.num_samples, return_scores=True, tgt=pilot_tgt,
             )
             pilot_eval_count += args.batch_size
             all_scores.append(scores)
@@ -247,12 +241,11 @@ def main():
             pilot_ctx, pilot_tgt = next(test_dtl)
             pilot_ctx = pilot_ctx[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
             pilot_tgt = pilot_tgt[:min(args.batch_size, args.num_pilot_samples-pilot_eval_count)].to(device)
-            tau, delta = None, None
             if revin is not None:
-                pilot_ctx, tau, delta = revin(pilot_ctx, mode="norm")
-                pilot_tgt, _, _ = revin(pilot_tgt, mode="norm", reuse_stats=True)
+                pilot_ctx = revin(pilot_ctx, mode="norm")
+                pilot_tgt = revin(pilot_tgt, mode="norm", reuse_stats=True)
             _, scores, steps = model.sample(
-                pilot_ctx, num_samples=args.num_samples, return_scores=True, tau=tau, delta=delta, tgt=pilot_tgt,
+                pilot_ctx, num_samples=args.num_samples, return_scores=True, tgt=pilot_tgt,
             )
             pilot_eval_count += args.batch_size
             all_scores.append(scores)
